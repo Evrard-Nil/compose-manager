@@ -29,6 +29,28 @@ struct StatusResponse {
     error: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+struct ComposeRequest {
+    #[serde(default)]
+    file: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ComposeDownRequest {
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    volumes: bool,
+}
+
+#[derive(Deserialize)]
+struct CleanRequest {
+    #[serde(default)]
+    volumes: bool,
+    #[serde(default)]
+    images: bool,
+}
+
 #[derive(Deserialize)]
 struct CheckoutRequest {
     tag: String,
@@ -130,12 +152,14 @@ fn verify_bearer_token(headers: &HeaderMap, expected: &str) -> Result<(), (Statu
 async fn compose_up(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    body: Option<Json<ComposeRequest>>,
 ) -> impl IntoResponse {
     if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
         return e;
     }
 
-    match run_docker_compose(&state.repo_path, &["up", "-d"]) {
+    let file = body.and_then(|b| b.file.clone());
+    match run_docker_compose(&state.repo_path, &["up", "-d"], file.as_deref()) {
         Ok(_) => (
             StatusCode::OK,
             Json(StatusResponse {
@@ -158,12 +182,23 @@ async fn compose_up(
 async fn compose_down(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    body: Option<Json<ComposeDownRequest>>,
 ) -> impl IntoResponse {
     if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
         return e;
     }
 
-    match run_docker_compose(&state.repo_path, &["down"]) {
+    let (file, volumes) = body
+        .map(|b| (b.file.clone(), b.volumes))
+        .unwrap_or((None, false));
+
+    let args: Vec<&str> = if volumes {
+        vec!["down", "-v"]
+    } else {
+        vec!["down"]
+    };
+
+    match run_docker_compose(&state.repo_path, &args, file.as_deref()) {
         Ok(_) => (
             StatusCode::OK,
             Json(StatusResponse {
@@ -212,6 +247,46 @@ async fn git_checkout(
                 }),
             )
         }
+    }
+}
+
+async fn docker_clean(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CleanRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    if !payload.volumes && !payload.images {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(StatusResponse {
+                status: "error".to_string(),
+                tag: None,
+                error: Some("At least one of 'volumes' or 'images' must be true".to_string()),
+            }),
+        );
+    }
+
+    match run_docker_prune(payload.volumes, payload.images) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(StatusResponse {
+                status: "ok".to_string(),
+                tag: None,
+                error: None,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(StatusResponse {
+                status: "error".to_string(),
+                tag: None,
+                error: Some(e.to_string()),
+            }),
+        ),
     }
 }
 
@@ -327,8 +402,12 @@ async fn get_commit_date(owner: &str, repo: &str, sha: &str) -> Result<DateTime<
     Ok(commit.commit.committer.date)
 }
 
-fn run_docker_compose(repo_path: &PathBuf, args: &[&str]) -> Result<String> {
+fn run_docker_compose(repo_path: &PathBuf, args: &[&str], file: Option<&str>) -> Result<String> {
     let mut cmd_args = vec!["compose"];
+    if let Some(f) = file {
+        cmd_args.push("-f");
+        cmd_args.push(f);
+    }
     cmd_args.extend(args);
 
     let output = Command::new("docker")
@@ -343,6 +422,38 @@ fn run_docker_compose(repo_path: &PathBuf, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
+    let mut output_text = String::new();
+
+    if volumes {
+        let output = Command::new("docker")
+            .args(["volume", "prune", "-f"])
+            .output()
+            .context("Failed to prune volumes")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("docker volume prune failed: {}", stderr));
+        }
+        output_text.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    if images {
+        let output = Command::new("docker")
+            .args(["image", "prune", "-af"])
+            .output()
+            .context("Failed to prune images")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("docker image prune failed: {}", stderr));
+        }
+        output_text.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    Ok(output_text)
 }
 
 fn run_git(repo_path: &PathBuf, args: &[&str]) -> Result<String> {
@@ -405,6 +516,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/compose/up", post(compose_up))
         .route("/compose/down", post(compose_down))
+        .route("/docker/clean", post(docker_clean))
         .route("/git/checkout", post(git_checkout))
         .with_state(state);
 

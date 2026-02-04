@@ -16,9 +16,16 @@ Single-file Rust application (`src/main.rs`) using:
 
 1. **AppState** - Holds configuration (repo URL, token, paths, parsed owner/repo)
 2. **Authentication** - `verify_bearer_token()` validates Authorization header
-3. **Handlers** - `compose_up`, `compose_down`, `git_checkout`
+3. **Handlers** - `compose_up`, `compose_down`, `docker_clean`, `git_checkout`
 4. **GitHub API** - `get_tag_commit_sha()` and `get_commit_date()` for tag validation
-5. **Shell commands** - `run_docker_compose()`, `run_git()`, `run_git_clone()`
+5. **Shell commands** - `run_docker_compose()`, `run_docker_prune()`, `run_git()`, `run_git_clone()`
+
+## Request Structs
+
+- `ComposeRequest` - Optional `file` field for compose up
+- `ComposeDownRequest` - Optional `file` and `volumes` fields
+- `CleanRequest` - `volumes` and `images` booleans for pruning
+- `CheckoutRequest` - Required `tag` field
 
 ## Build & Run
 

@@ -5,7 +5,9 @@ A minimalistic Rust HTTP service that manages Docker Compose deployments from a 
 ## Features
 
 - **Remote deployment control**: Start and stop Docker Compose services via HTTP API
+- **Multiple compose files**: Specify which compose file to use per request
 - **Git tag checkout**: Checkout specific repository tags with configurable age validation
+- **Docker cleanup**: Prune unused volumes and images to save disk space
 - **Bearer token authentication**: Secure all endpoints with a shared secret
 
 ## API Endpoints
@@ -13,8 +15,34 @@ A minimalistic Rust HTTP service that manages Docker Compose deployments from a 
 ### POST /compose/up
 Start containers with `docker compose up -d`.
 
+**Request body (optional):**
+```json
+{"file": "docker-compose.prod.yml"}
+```
+
 ### POST /compose/down
 Stop containers with `docker compose down`.
+
+**Request body (optional):**
+```json
+{"file": "docker-compose.prod.yml", "volumes": true}
+```
+
+- `file`: Specify compose file (optional)
+- `volumes`: Also remove volumes with `-v` flag (default: false)
+
+### POST /docker/clean
+Prune unused Docker resources.
+
+**Request body:**
+```json
+{"volumes": true, "images": true}
+```
+
+- `volumes`: Prune unused volumes (default: false)
+- `images`: Prune all unused images (default: false)
+
+At least one option must be true.
 
 ### POST /git/checkout
 Checkout a specific git tag.
@@ -57,13 +85,31 @@ curl -X POST http://localhost:8080/git/checkout \
   -H "Content-Type: application/json" \
   -d '{"tag": "v1.0.0"}'
 
-# Start containers
+# Start containers (default compose file)
 curl -X POST http://localhost:8080/compose/up \
   -H "Authorization: Bearer your-secret-token"
+
+# Start containers (specific compose file)
+curl -X POST http://localhost:8080/compose/up \
+  -H "Authorization: Bearer your-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "docker-compose.prod.yml"}'
 
 # Stop containers
 curl -X POST http://localhost:8080/compose/down \
   -H "Authorization: Bearer your-secret-token"
+
+# Stop containers and remove volumes
+curl -X POST http://localhost:8080/compose/down \
+  -H "Authorization: Bearer your-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"volumes": true}'
+
+# Clean up unused volumes and images
+curl -X POST http://localhost:8080/docker/clean \
+  -H "Authorization: Bearer your-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"volumes": true, "images": true}'
 ```
 
 ### Docker
