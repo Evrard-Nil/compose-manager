@@ -3,22 +3,28 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, process::Command, sync::Arc};
+use tokio::sync::RwLock;
 
-#[derive(Clone)]
+// --- Application State ---
+
 struct AppState {
-    github_repo: String,
     bearer_token: String,
-    repo_path: PathBuf,
     github_owner: String,
     github_repo_name: String,
     min_tag_age_hours: i64,
+    work_dir: PathBuf,
+    current_tag: RwLock<Option<String>>,
+    deployed_tag: RwLock<Option<String>>,
+    http: reqwest::Client,
 }
+
+// --- API Types ---
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -27,6 +33,21 @@ struct StatusResponse {
     tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+type ApiResult = (StatusCode, Json<StatusResponse>);
+
+fn ok(tag: Option<String>) -> ApiResult {
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, error: None }))
+}
+
+fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
+    (code, Json(StatusResponse { status: "error".into(), tag: None, error: Some(msg.into()) }))
+}
+
+#[derive(Deserialize)]
+struct CheckoutRequest {
+    tag: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -51,40 +72,15 @@ struct CleanRequest {
     images: bool,
 }
 
-#[derive(Deserialize)]
-struct CheckoutRequest {
-    tag: String,
-}
-
-#[derive(Deserialize)]
-struct GitHubRef {
-    object: GitHubObject,
-}
-
-#[derive(Deserialize)]
-struct GitHubObject {
-    sha: String,
-    #[serde(rename = "type")]
-    object_type: String,
-}
-
-#[derive(Deserialize)]
-struct GitHubTag {
-    object: GitHubTagObject,
-}
-
-#[derive(Deserialize)]
-struct GitHubTagObject {
-    sha: String,
-}
+// --- GitHub ---
 
 #[derive(Deserialize)]
 struct GitHubCommit {
-    commit: GitHubCommitInfo,
+    commit: GitHubCommitDetail,
 }
 
 #[derive(Deserialize)]
-struct GitHubCommitInfo {
+struct GitHubCommitDetail {
     committer: GitHubCommitter,
 }
 
@@ -93,60 +89,91 @@ struct GitHubCommitter {
     date: DateTime<Utc>,
 }
 
-fn parse_github_url(url: &str) -> Result<(String, String)> {
-    let url = url
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
+async fn get_tag_commit_date(state: &AppState, tag: &str) -> Result<DateTime<Utc>> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/commits/{}",
+        state.github_owner, state.github_repo_name, tag
+    );
 
-    let parts: Vec<&str> = url.split('/').collect();
-    if parts.len() < 2 {
-        return Err(anyhow!("Invalid GitHub URL format"));
+    let resp = state.http.get(&url)
+        .header("User-Agent", "compose-manager")
+        .send().await
+        .context("Failed to query GitHub API")?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("tag not found: {}", tag));
     }
 
-    let repo = parts[parts.len() - 1].to_string();
-    let owner = parts[parts.len() - 2].to_string();
+    let commit: GitHubCommit = resp.json().await
+        .context("Failed to parse GitHub response")?;
 
-    Ok((owner, repo))
+    Ok(commit.commit.committer.date)
 }
 
-fn verify_bearer_token(headers: &HeaderMap, expected: &str) -> Result<(), (StatusCode, Json<StatusResponse>)> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(StatusResponse {
-                    status: "error".to_string(),
-                    tag: None,
-                    error: Some("Missing Authorization header".to_string()),
-                }),
-            )
-        })?;
+async fn fetch_github_file(state: &AppState, tag: &str, path: &str) -> Result<String> {
+    let url = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/{}",
+        state.github_owner, state.github_repo_name, tag, path
+    );
 
-    let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(StatusResponse {
-                status: "error".to_string(),
-                tag: None,
-                error: Some("Invalid Authorization header format".to_string()),
-            }),
-        )
-    })?;
+    let resp = state.http.get(&url)
+        .send().await
+        .context("Failed to fetch file from GitHub")?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow!("file '{}' not found at tag '{}'", path, tag));
+    }
+
+    resp.text().await.context("Failed to read file content")
+}
+
+// --- Auth ---
+
+fn verify_bearer_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiResult> {
+    let token = headers.get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header"))?;
 
     if token != expected {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(StatusResponse {
-                status: "error".to_string(),
-                tag: None,
-                error: Some("Invalid token".to_string()),
-            }),
-        ));
+        return Err(err(StatusCode::UNAUTHORIZED, "Invalid token"));
     }
 
     Ok(())
+}
+
+// --- Handlers ---
+
+async fn git_checkout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CheckoutRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    let commit_date = match get_tag_commit_date(&state, &payload.tag).await {
+        Ok(d) => d,
+        Err(e) => {
+            let code = if e.to_string().contains("not found") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return err(code, e.to_string());
+        }
+    };
+
+    let min_age = Utc::now() - chrono::Duration::hours(state.min_tag_age_hours);
+    if commit_date > min_age {
+        return err(StatusCode::BAD_REQUEST, format!(
+            "tag too recent: {} is less than {} hours old", commit_date, state.min_tag_age_hours
+        ));
+    }
+
+    *state.current_tag.write().await = Some(payload.tag.clone());
+    ok(Some(payload.tag))
 }
 
 async fn compose_up(
@@ -158,24 +185,32 @@ async fn compose_up(
         return e;
     }
 
-    let file = body.and_then(|b| b.file.clone());
-    match run_docker_compose(&state.repo_path, &["up", "-d"], file.as_deref()) {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(StatusResponse {
-                status: "ok".to_string(),
-                tag: None,
-                error: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(StatusResponse {
-                status: "error".to_string(),
-                tag: None,
-                error: Some(e.to_string()),
-            }),
-        ),
+    let tag = state.current_tag.read().await.clone();
+    let Some(tag) = tag else {
+        return err(StatusCode::BAD_REQUEST, "No tag set. Call /git/checkout first.");
+    };
+
+    let file = body.and_then(|b| b.file.clone()).unwrap_or_else(|| "docker-compose.yml".into());
+
+    // Fetch compose file from GitHub and write to work directory
+    let content = match fetch_github_file(&state, &tag, &file).await {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+
+    if let Err(e) = tokio::fs::create_dir_all(&state.work_dir).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create work dir: {}", e));
+    }
+    if let Err(e) = tokio::fs::write(state.work_dir.join(&file), &content).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e));
+    }
+
+    match run_docker_compose(&state.work_dir, &["up", "-d"], &file) {
+        Ok(_) => {
+            *state.deployed_tag.write().await = Some(tag);
+            ok(None)
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -192,61 +227,13 @@ async fn compose_down(
         .map(|b| (b.file.clone(), b.volumes))
         .unwrap_or((None, false));
 
-    let args: Vec<&str> = if volumes {
-        vec!["down", "-v"]
-    } else {
-        vec!["down"]
-    };
+    let file = file.unwrap_or_else(|| "docker-compose.yml".into());
+    let mut args = vec!["down"];
+    if volumes { args.push("-v"); }
 
-    match run_docker_compose(&state.repo_path, &args, file.as_deref()) {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(StatusResponse {
-                status: "ok".to_string(),
-                tag: None,
-                error: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(StatusResponse {
-                status: "error".to_string(),
-                tag: None,
-                error: Some(e.to_string()),
-            }),
-        ),
-    }
-}
-
-async fn git_checkout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(payload): Json<CheckoutRequest>,
-) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
-        return e;
-    }
-
-    match do_git_checkout(&state, &payload.tag).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(StatusResponse {
-                status: "ok".to_string(),
-                tag: Some(payload.tag),
-                error: None,
-            }),
-        ),
-        Err(e) => {
-            let (status, msg) = categorize_error(&e);
-            (
-                status,
-                Json(StatusResponse {
-                    status: "error".to_string(),
-                    tag: None,
-                    error: Some(msg),
-                }),
-            )
-        }
+    match run_docker_compose(&state.work_dir, &args, &file) {
+        Ok(_) => ok(None),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -260,165 +247,32 @@ async fn docker_clean(
     }
 
     if !payload.volumes && !payload.images {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(StatusResponse {
-                status: "error".to_string(),
-                tag: None,
-                error: Some("At least one of 'volumes' or 'images' must be true".to_string()),
-            }),
-        );
+        return err(StatusCode::BAD_REQUEST, "At least one of 'volumes' or 'images' must be true");
     }
 
     match run_docker_prune(payload.volumes, payload.images) {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(StatusResponse {
-                status: "ok".to_string(),
-                tag: None,
-                error: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(StatusResponse {
-                status: "error".to_string(),
-                tag: None,
-                error: Some(e.to_string()),
-            }),
-        ),
+        Ok(_) => ok(None),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
-fn categorize_error(e: &anyhow::Error) -> (StatusCode, String) {
-    let msg = e.to_string();
-    if msg.contains("tag too recent") || msg.contains("not found") {
-        (StatusCode::BAD_REQUEST, msg)
-    } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    }
+async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let tag = state.deployed_tag.read().await.clone();
+    ok(tag)
 }
 
-async fn do_git_checkout(state: &AppState, tag: &str) -> Result<()> {
-    // Clone or fetch the repository
-    if state.repo_path.exists() {
-        run_git(&state.repo_path, &["fetch", "--tags", "--force"])
-            .context("Failed to fetch repository")?;
-    } else {
-        run_git_clone(&state.github_repo, &state.repo_path)
-            .context("Failed to clone repository")?;
-    }
+// --- Shell Commands ---
 
-    // Get commit SHA for the tag via GitHub API
-    let commit_sha = get_tag_commit_sha(&state.github_owner, &state.github_repo_name, tag).await?;
-
-    // Get commit date via GitHub API
-    let commit_date = get_commit_date(&state.github_owner, &state.github_repo_name, &commit_sha).await?;
-
-    // Check if tag is at least min_tag_age_hours old
-    let min_age = Utc::now() - chrono::Duration::hours(state.min_tag_age_hours);
-    if commit_date > min_age {
-        return Err(anyhow!("tag too recent: commit date {} is less than {} hours old", commit_date, state.min_tag_age_hours));
-    }
-
-    // Checkout the tag
-    run_git(&state.repo_path, &["checkout", tag])
-        .context("Failed to checkout tag")?;
-
-    Ok(())
-}
-
-async fn get_tag_commit_sha(owner: &str, repo: &str, tag: &str) -> Result<String> {
-    let client = reqwest::Client::new();
-
-    // First, get the ref for the tag
-    let ref_url = format!(
-        "https://api.github.com/repos/{}/{}/git/refs/tags/{}",
-        owner, repo, tag
-    );
-
-    let response = client
-        .get(&ref_url)
-        .header("User-Agent", "compose-manager")
-        .send()
-        .await
-        .context("Failed to fetch tag ref from GitHub")?;
-
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(anyhow!("tag not found: {}", tag));
-    }
-
-    let git_ref: GitHubRef = response
-        .json()
-        .await
-        .context("Failed to parse GitHub ref response")?;
-
-    // If it's an annotated tag, we need to dereference it to get the commit
-    if git_ref.object.object_type == "tag" {
-        let tag_url = format!(
-            "https://api.github.com/repos/{}/{}/git/tags/{}",
-            owner, repo, git_ref.object.sha
-        );
-
-        let tag_response = client
-            .get(&tag_url)
-            .header("User-Agent", "compose-manager")
-            .send()
-            .await
-            .context("Failed to fetch tag object from GitHub")?;
-
-        let tag_obj: GitHubTag = tag_response
-            .json()
-            .await
-            .context("Failed to parse GitHub tag response")?;
-
-        Ok(tag_obj.object.sha)
-    } else {
-        // Lightweight tag, points directly to commit
-        Ok(git_ref.object.sha)
-    }
-}
-
-async fn get_commit_date(owner: &str, repo: &str, sha: &str) -> Result<DateTime<Utc>> {
-    let client = reqwest::Client::new();
-
-    let commit_url = format!(
-        "https://api.github.com/repos/{}/{}/commits/{}",
-        owner, repo, sha
-    );
-
-    let response = client
-        .get(&commit_url)
-        .header("User-Agent", "compose-manager")
-        .send()
-        .await
-        .context("Failed to fetch commit from GitHub")?;
-
-    let commit: GitHubCommit = response
-        .json()
-        .await
-        .context("Failed to parse GitHub commit response")?;
-
-    Ok(commit.commit.committer.date)
-}
-
-fn run_docker_compose(repo_path: &PathBuf, args: &[&str], file: Option<&str>) -> Result<String> {
-    let mut cmd_args = vec!["compose"];
-    if let Some(f) = file {
-        cmd_args.push("-f");
-        cmd_args.push(f);
-    }
-    cmd_args.extend(args);
-
+fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str) -> Result<String> {
     let output = Command::new("docker")
-        .args(&cmd_args)
-        .current_dir(repo_path)
+        .args(["compose", "-f", file])
+        .args(args)
+        .current_dir(work_dir)
         .output()
         .context("Failed to execute docker compose")?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("docker compose failed: {}", stderr));
+        return Err(anyhow!("docker compose failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -432,10 +286,8 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
             .args(["volume", "prune", "-f"])
             .output()
             .context("Failed to prune volumes")?;
-
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("docker volume prune failed: {}", stderr));
+            return Err(anyhow!("docker volume prune failed: {}", String::from_utf8_lossy(&output.stderr)));
         }
         output_text.push_str(&String::from_utf8_lossy(&output.stdout));
     }
@@ -445,10 +297,8 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
             .args(["image", "prune", "-af"])
             .output()
             .context("Failed to prune images")?;
-
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("docker image prune failed: {}", stderr));
+            return Err(anyhow!("docker image prune failed: {}", String::from_utf8_lossy(&output.stderr)));
         }
         output_text.push_str(&String::from_utf8_lossy(&output.stdout));
     }
@@ -456,61 +306,41 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
     Ok(output_text)
 }
 
-fn run_git(repo_path: &PathBuf, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
-        .context("Failed to execute git command")?;
+// --- Main ---
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("git command failed: {}", stderr));
+fn parse_github_url(url: &str) -> Result<(String, String)> {
+    let url = url.trim_end_matches('/').trim_end_matches(".git");
+    let parts: Vec<&str> = url.split('/').collect();
+    if parts.len() < 2 {
+        return Err(anyhow!("Invalid GitHub URL format"));
     }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn run_git_clone(repo_url: &str, dest: &PathBuf) -> Result<String> {
-    let output = Command::new("git")
-        .args(["clone", repo_url, dest.to_str().unwrap()])
-        .output()
-        .context("Failed to execute git clone")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("git clone failed: {}", stderr));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok((parts[parts.len() - 2].to_string(), parts[parts.len() - 1].to_string()))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let github_repo = std::env::var("GITHUB_REPO")
         .context("GITHUB_REPO environment variable is required")?;
-
     let bearer_token = std::env::var("BEARER_TOKEN")
         .context("BEARER_TOKEN environment variable is required")?;
-
-    let repo_path = std::env::var("REPO_PATH")
-        .unwrap_or_else(|_| "/app/repo".to_string());
-
+    let work_dir = std::env::var("WORK_DIR")
+        .unwrap_or_else(|_| "/app/work".to_string());
     let min_tag_age_hours: i64 = std::env::var("MIN_TAG_AGE_HOURS")
         .unwrap_or_else(|_| "48".to_string())
         .parse()
         .context("MIN_TAG_AGE_HOURS must be a valid integer")?;
 
-    let (github_owner, github_repo_name) = parse_github_url(&github_repo)
-        .context("Failed to parse GITHUB_REPO URL")?;
+    let (github_owner, github_repo_name) = parse_github_url(&github_repo)?;
 
     let state = Arc::new(AppState {
-        github_repo,
         bearer_token,
-        repo_path: PathBuf::from(repo_path),
         github_owner,
         github_repo_name,
         min_tag_age_hours,
+        work_dir: PathBuf::from(work_dir),
+        current_tag: RwLock::new(None),
+        deployed_tag: RwLock::new(None),
+        http: reqwest::Client::new(),
     });
 
     let app = Router::new()
@@ -518,6 +348,7 @@ async fn main() -> Result<()> {
         .route("/compose/down", post(compose_down))
         .route("/docker/clean", post(docker_clean))
         .route("/git/checkout", post(git_checkout))
+        .route("/version", get(version))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
