@@ -42,10 +42,6 @@ GITHUB_REPO="..." BEARER_TOKEN="..." ./target/release/compose-manager
 - `WORK_DIR` (default: `/app/work`) — Directory for downloaded compose files
 - `MIN_TAG_AGE_HOURS` (default: `48`) — Minimum tag age; set to `0` for development
 
-## Docker
-
-Multi-stage build: `rust:1.75-slim` builder, `debian:bookworm-slim` runtime. Runtime needs docker-compose-plugin (no git required).
-
 ## CI/CD
 
 GitHub Actions workflow (`.github/workflows/build.yml`) builds a reproducible Docker image using `build-image.sh` and pushes to Docker Hub. Triggers on pushes to `master` (tagged `latest`) and `v*` tags (tagged with version number). Includes artifact attestation via Sigstore.
