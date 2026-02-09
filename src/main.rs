@@ -19,6 +19,7 @@ struct AppState {
     github_repo_name: String,
     min_tag_age_hours: i64,
     work_dir: PathBuf,
+    env_files: Vec<String>,
     current_tag: RwLock<Option<String>>,
     deployed_tag: RwLock<Option<String>>,
     http: reqwest::Client,
@@ -223,7 +224,7 @@ async fn compose_up(
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e));
     }
 
-    match run_docker_compose(&state.work_dir, &["up", "-d"], &file) {
+    match run_docker_compose(&state.work_dir, &["up", "-d"], &file, &state.env_files) {
         Ok(_) => {
             *state.deployed_tag.write().await = Some(tag);
             ok(None)
@@ -249,7 +250,7 @@ async fn compose_down(
     let mut args = vec!["down"];
     if volumes { args.push("-v"); }
 
-    match run_docker_compose(&state.work_dir, &args, &file) {
+    match run_docker_compose(&state.work_dir, &args, &file, &state.env_files) {
         Ok(_) => ok(None),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -290,7 +291,7 @@ async fn compose_logs(
     let file = file.unwrap_or_else(|| "docker-compose.yml".into());
     let tail_str = tail.to_string();
 
-    match run_docker_compose(&state.work_dir, &["logs", "--tail", &tail_str], &file) {
+    match run_docker_compose(&state.work_dir, &["logs", "--tail", &tail_str], &file, &state.env_files) {
         Ok(output) => ok_output(output),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -303,9 +304,13 @@ async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // --- Shell Commands ---
 
-fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str) -> Result<String> {
-    let output = Command::new("docker")
-        .args(["compose", "-f", file])
+fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str, env_files: &[String]) -> Result<String> {
+    let mut cmd = Command::new("docker");
+    cmd.args(["compose", "-f", file]);
+    for env_file in env_files {
+        cmd.args(["--env-file", env_file]);
+    }
+    let output = cmd
         .args(args)
         .current_dir(work_dir)
         .output()
@@ -390,6 +395,13 @@ async fn main() -> Result<()> {
         .parse()
         .context("MIN_TAG_AGE_HOURS must be a valid integer")?;
 
+    let env_files: Vec<String> = std::env::var("ENV_FILES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let (github_owner, github_repo_name) = parse_github_url(&github_repo)?;
 
     let state = Arc::new(AppState {
@@ -398,6 +410,7 @@ async fn main() -> Result<()> {
         github_repo_name,
         min_tag_age_hours,
         work_dir: PathBuf::from(work_dir),
+        env_files,
         current_tag: RwLock::new(None),
         deployed_tag: RwLock::new(None),
         http: reqwest::Client::new(),

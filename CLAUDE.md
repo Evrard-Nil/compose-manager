@@ -41,6 +41,7 @@ GITHUB_REPO="..." BEARER_TOKEN="..." ./target/release/compose-manager
 - `BEARER_TOKEN` (required) — Auth token for API requests
 - `WORK_DIR` (default: `/app/work`) — Directory for downloaded compose files
 - `MIN_TAG_AGE_HOURS` (default: `48`) — Minimum tag age; set to `0` for development
+- `ENV_FILES` (optional) — Comma-separated list of env file paths passed as `--env-file` flags to all `docker compose` commands (e.g. `ENV_FILES=/etc/app/.env,/etc/app/.env.gpu`)
 
 ## CI/CD
 
