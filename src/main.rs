@@ -269,10 +269,20 @@ fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str) -> Result<S
         .args(args)
         .current_dir(work_dir)
         .output()
-        .context("Failed to execute docker compose")?;
+        .with_context(|| format!(
+            "Failed to execute: docker compose -f {} {} (work_dir: {})",
+            file, args.join(" "), work_dir.display()
+        ))?;
 
     if !output.status.success() {
-        return Err(anyhow!("docker compose failed: {}", String::from_utf8_lossy(&output.stderr)));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "docker compose failed (exit {}):\nstderr: {}\nstdout: {}",
+            output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
+            stderr,
+            stdout
+        ));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -285,9 +295,14 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
         let output = Command::new("docker")
             .args(["volume", "prune", "-f"])
             .output()
-            .context("Failed to prune volumes")?;
+            .context("Failed to execute: docker volume prune -f")?;
         if !output.status.success() {
-            return Err(anyhow!("docker volume prune failed: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(anyhow!(
+                "docker volume prune failed (exit {}):\nstderr: {}\nstdout: {}",
+                output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            ));
         }
         output_text.push_str(&String::from_utf8_lossy(&output.stdout));
     }
@@ -296,9 +311,14 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
         let output = Command::new("docker")
             .args(["image", "prune", "-af"])
             .output()
-            .context("Failed to prune images")?;
+            .context("Failed to execute: docker image prune -af")?;
         if !output.status.success() {
-            return Err(anyhow!("docker image prune failed: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(anyhow!(
+                "docker image prune failed (exit {}):\nstderr: {}\nstdout: {}",
+                output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            ));
         }
         output_text.push_str(&String::from_utf8_lossy(&output.stdout));
     }
