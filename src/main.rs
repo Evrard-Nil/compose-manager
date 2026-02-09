@@ -32,17 +32,23 @@ struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 type ApiResult = (StatusCode, Json<StatusResponse>);
 
 fn ok(tag: Option<String>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, output: None, error: None }))
+}
+
+fn ok_output(output: String) -> ApiResult {
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, output: Some(output), error: None }))
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
-    (code, Json(StatusResponse { status: "error".into(), tag: None, error: Some(msg.into()) }))
+    (code, Json(StatusResponse { status: "error".into(), tag: None, output: None, error: Some(msg.into()) }))
 }
 
 #[derive(Deserialize)]
@@ -70,6 +76,18 @@ struct CleanRequest {
     volumes: bool,
     #[serde(default)]
     images: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct LogsRequest {
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default = "default_tail")]
+    tail: u32,
+}
+
+fn default_tail() -> u32 {
+    100
 }
 
 // --- GitHub ---
@@ -256,6 +274,28 @@ async fn docker_clean(
     }
 }
 
+async fn compose_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Option<Json<LogsRequest>>,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    let (file, tail) = body
+        .map(|b| (b.file.clone(), b.tail))
+        .unwrap_or((None, default_tail()));
+
+    let file = file.unwrap_or_else(|| "docker-compose.yml".into());
+    let tail_str = tail.to_string();
+
+    match run_docker_compose(&state.work_dir, &["logs", "--tail", &tail_str], &file) {
+        Ok(output) => ok_output(output),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let tag = state.deployed_tag.read().await.clone();
     ok(tag)
@@ -366,6 +406,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/compose/up", post(compose_up))
         .route("/compose/down", post(compose_down))
+        .route("/compose/logs", post(compose_logs))
         .route("/docker/clean", post(docker_clean))
         .route("/git/checkout", post(git_checkout))
         .route("/version", get(version))
