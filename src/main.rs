@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, process::Command, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::{error, info};
 
 // --- Application State ---
 
@@ -305,6 +306,7 @@ async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 // --- Shell Commands ---
 
 fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str, env_files: &[String]) -> Result<String> {
+    info!(command = "docker compose", file = file, args = ?args, work_dir = %work_dir.display(), "Running command");
     let mut cmd = Command::new("docker");
     cmd.args(["compose", "-f", file]);
     for env_file in env_files {
@@ -322,6 +324,7 @@ fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str, env_files: 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+        error!(file = file, args = ?args, exit_code = output.status.code(), %stderr, "Command failed");
         return Err(anyhow!(
             "docker compose failed (exit {}):\nstderr: {}\nstdout: {}",
             output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
@@ -330,6 +333,7 @@ fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str, env_files: 
         ));
     }
 
+    info!(command = "docker compose", file = file, args = ?args, "Command completed successfully");
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
@@ -337,11 +341,13 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
     let mut output_text = String::new();
 
     if volumes {
+        info!(command = "docker volume prune", "Running command");
         let output = Command::new("docker")
             .args(["volume", "prune", "-f"])
             .output()
             .context("Failed to execute: docker volume prune -f")?;
         if !output.status.success() {
+            error!(command = "docker volume prune", exit_code = output.status.code(), "Command failed");
             return Err(anyhow!(
                 "docker volume prune failed (exit {}):\nstderr: {}\nstdout: {}",
                 output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
@@ -349,15 +355,18 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
                 String::from_utf8_lossy(&output.stdout)
             ));
         }
+        info!(command = "docker volume prune", "Command completed successfully");
         output_text.push_str(&String::from_utf8_lossy(&output.stdout));
     }
 
     if images {
+        info!(command = "docker image prune", "Running command");
         let output = Command::new("docker")
             .args(["image", "prune", "-af"])
             .output()
             .context("Failed to execute: docker image prune -af")?;
         if !output.status.success() {
+            error!(command = "docker image prune", exit_code = output.status.code(), "Command failed");
             return Err(anyhow!(
                 "docker image prune failed (exit {}):\nstderr: {}\nstdout: {}",
                 output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
@@ -365,6 +374,7 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
                 String::from_utf8_lossy(&output.stdout)
             ));
         }
+        info!(command = "docker image prune", "Command completed successfully");
         output_text.push_str(&String::from_utf8_lossy(&output.stdout));
     }
 
@@ -384,6 +394,8 @@ fn parse_github_url(url: &str) -> Result<(String, String)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let github_repo = std::env::var("GITHUB_REPO")
         .context("GITHUB_REPO environment variable is required")?;
     let bearer_token = std::env::var("BEARER_TOKEN")
@@ -426,7 +438,7 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    println!("Server listening on port 8080");
+    info!("Server listening on port 8080");
     axum::serve(listener, app).await?;
 
     Ok(())
