@@ -306,7 +306,7 @@ async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 // --- Shell Commands ---
 
 fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str, env_files: &[String]) -> Result<String> {
-    info!(command = "docker compose", file = file, args = ?args, work_dir = %work_dir.display(), "Running command");
+    info!(command = "docker compose", file = file, args = ?args, env_files = ?env_files, work_dir = %work_dir.display(), "Running command");
     let mut cmd = Command::new("docker");
     cmd.args(["compose", "-f", file]);
     for env_file in env_files {
