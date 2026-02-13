@@ -62,6 +62,8 @@ struct CheckoutRequest {
 struct ComposeRequest {
     #[serde(default)]
     file: Option<String>,
+    #[serde(default)]
+    services: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +72,8 @@ struct ComposeDownRequest {
     file: Option<String>,
     #[serde(default)]
     volumes: bool,
+    #[serde(default)]
+    services: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +90,8 @@ struct LogsRequest {
     file: Option<String>,
     #[serde(default = "default_tail")]
     tail: u32,
+    #[serde(default)]
+    services: Vec<String>,
 }
 
 fn default_tail() -> u32 {
@@ -210,7 +216,10 @@ async fn compose_up(
         return err(StatusCode::BAD_REQUEST, "No tag set. Call /git/checkout first.");
     };
 
-    let file = body.and_then(|b| b.file.clone()).unwrap_or_else(|| "docker-compose.yml".into());
+    let (file, services) = body
+        .map(|b| (b.file.clone(), b.services.clone()))
+        .unwrap_or_default();
+    let file = file.unwrap_or_else(|| "docker-compose.yml".into());
 
     // Fetch compose file from GitHub and write to work directory
     let content = match fetch_github_file(&state, &tag, &file).await {
@@ -225,7 +234,7 @@ async fn compose_up(
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e));
     }
 
-    match run_docker_compose(&state.work_dir, &["up", "-d"], &file, &state.env_files) {
+    match run_docker_compose(&state.work_dir, &["up", "-d"], &file, &state.env_files, &services) {
         Ok(_) => {
             *state.deployed_tag.write().await = Some(tag);
             ok(None)
@@ -243,15 +252,15 @@ async fn compose_down(
         return e;
     }
 
-    let (file, volumes) = body
-        .map(|b| (b.file.clone(), b.volumes))
-        .unwrap_or((None, false));
+    let (file, volumes, services) = body
+        .map(|b| (b.file.clone(), b.volumes, b.services.clone()))
+        .unwrap_or((None, false, vec![]));
 
     let file = file.unwrap_or_else(|| "docker-compose.yml".into());
     let mut args = vec!["down"];
     if volumes { args.push("-v"); }
 
-    match run_docker_compose(&state.work_dir, &args, &file, &state.env_files) {
+    match run_docker_compose(&state.work_dir, &args, &file, &state.env_files, &services) {
         Ok(_) => ok(None),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -285,14 +294,14 @@ async fn compose_logs(
         return e;
     }
 
-    let (file, tail) = body
-        .map(|b| (b.file.clone(), b.tail))
-        .unwrap_or((None, default_tail()));
+    let (file, tail, services) = body
+        .map(|b| (b.file.clone(), b.tail, b.services.clone()))
+        .unwrap_or((None, default_tail(), vec![]));
 
     let file = file.unwrap_or_else(|| "docker-compose.yml".into());
     let tail_str = tail.to_string();
 
-    match run_docker_compose(&state.work_dir, &["logs", "--tail", &tail_str], &file, &state.env_files) {
+    match run_docker_compose(&state.work_dir, &["logs", "--tail", &tail_str], &file, &state.env_files, &services) {
         Ok(output) => ok_output(output),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -305,15 +314,18 @@ async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // --- Shell Commands ---
 
-fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str, env_files: &[String]) -> Result<String> {
-    info!(command = "docker compose", file = file, args = ?args, env_files = ?env_files, work_dir = %work_dir.display(), "Running command");
+fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str, env_files: &[String], services: &[String]) -> Result<String> {
+    info!(command = "docker compose", file = file, args = ?args, env_files = ?env_files, services = ?services, work_dir = %work_dir.display(), "Running command");
     let mut cmd = Command::new("docker");
     cmd.args(["compose", "-f", file]);
     for env_file in env_files {
         cmd.args(["--env-file", env_file]);
     }
+    cmd.args(args);
+    for service in services {
+        cmd.arg(service);
+    }
     let output = cmd
-        .args(args)
         .current_dir(work_dir)
         .output()
         .with_context(|| format!(
