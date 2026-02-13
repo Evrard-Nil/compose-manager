@@ -1,15 +1,29 @@
 use anyhow::{anyhow, Context, Result};
 use axum::{
+    body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, process::Command, sync::Arc};
-use tokio::sync::RwLock;
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    process::Command,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command as AsyncCommand,
+    sync::RwLock,
+};
 use tracing::{error, info};
 
 // --- Application State ---
@@ -21,7 +35,6 @@ struct AppState {
     min_tag_age_hours: i64,
     work_dir: PathBuf,
     env_files: Vec<String>,
-    current_tag: RwLock<Option<String>>,
     deployed_tag: RwLock<Option<String>>,
     http: reqwest::Client,
 }
@@ -53,27 +66,43 @@ fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
     (code, Json(StatusResponse { status: "error".into(), tag: None, output: None, error: Some(msg.into()) }))
 }
 
-#[derive(Deserialize)]
-struct CheckoutRequest {
-    tag: String,
+fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
+    let body = serde_json::to_string(&StatusResponse {
+        status: "error".into(),
+        tag: None,
+        output: None,
+        error: Some(msg.into()),
+    })
+    .unwrap();
+    Response::builder()
+        .status(code)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct ComposeRequest {
+    tag: String,
     #[serde(default)]
     file: Option<String>,
     #[serde(default)]
     services: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
 struct ComposeDownRequest {
+    tag: String,
     #[serde(default)]
     file: Option<String>,
     #[serde(default)]
     volumes: bool,
     #[serde(default)]
     services: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +125,48 @@ struct LogsRequest {
 
 fn default_tail() -> u32 {
     100
+}
+
+#[derive(Deserialize)]
+struct RestartRequest {
+    container: String,
+}
+
+// --- Env var validation ---
+
+fn is_valid_env_key(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let mut chars = key.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn validate_env_vars(env: &HashMap<String, String>) -> Result<(), String> {
+    for (key, value) in env {
+        if !is_valid_env_key(key) {
+            return Err(format!("invalid env var key: '{}' (must match [A-Za-z_][A-Za-z0-9_]*)", key));
+        }
+        if value.contains('\n') || value.contains('\r') {
+            return Err(format!("env var '{}' value must not contain newlines", key));
+        }
+    }
+    Ok(())
+}
+
+fn write_temp_env_file(work_dir: &Path, env: &HashMap<String, String>) -> Result<PathBuf> {
+    let path = work_dir.join(".env.tmp");
+    let content: String = env
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&path, content).context("Failed to write temp env file")?;
+    Ok(path)
 }
 
 // --- GitHub ---
@@ -136,6 +207,27 @@ async fn get_tag_commit_date(state: &AppState, tag: &str) -> Result<DateTime<Utc
     Ok(commit.commit.committer.date)
 }
 
+async fn validate_tag(state: &AppState, tag: &str) -> Result<(), (StatusCode, String)> {
+    let commit_date = get_tag_commit_date(state, tag).await.map_err(|e| {
+        let code = if e.to_string().contains("not found") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (code, e.to_string())
+    })?;
+
+    let min_age = Utc::now() - chrono::Duration::hours(state.min_tag_age_hours);
+    if commit_date > min_age {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("tag too recent: {} is less than {} hours old", commit_date, state.min_tag_age_hours),
+        ));
+    }
+
+    Ok(())
+}
+
 async fn fetch_github_file(state: &AppState, tag: &str, path: &str) -> Result<String> {
     let url = format!(
         "https://raw.githubusercontent.com/{}/{}/{}/{}",
@@ -168,121 +260,314 @@ fn verify_bearer_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiRes
     Ok(())
 }
 
-// --- Handlers ---
+fn verify_bearer_token_raw(headers: &HeaderMap, expected: &str) -> Result<(), (StatusCode, String)> {
+    let token = headers.get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header".to_string()))?;
 
-async fn git_checkout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(payload): Json<CheckoutRequest>,
-) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
-        return e;
+    if token != expected {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
     }
 
-    let commit_date = match get_tag_commit_date(&state, &payload.tag).await {
-        Ok(d) => d,
-        Err(e) => {
-            let code = if e.to_string().contains("not found") {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            return err(code, e.to_string());
-        }
-    };
-
-    let min_age = Utc::now() - chrono::Duration::hours(state.min_tag_age_hours);
-    if commit_date > min_age {
-        return err(StatusCode::BAD_REQUEST, format!(
-            "tag too recent: {} is less than {} hours old", commit_date, state.min_tag_age_hours
-        ));
-    }
-
-    *state.current_tag.write().await = Some(payload.tag.clone());
-    ok(Some(payload.tag))
+    Ok(())
 }
+
+// --- NDJSON Streaming ---
+
+#[derive(Serialize)]
+struct NdjsonEvent {
+    event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+}
+
+struct NdjsonStream {
+    stdout: Option<tokio::io::Lines<BufReader<tokio::process::ChildStdout>>>,
+    stderr: Option<tokio::io::Lines<BufReader<tokio::process::ChildStderr>>>,
+    wait_fut: Option<Pin<Box<dyn Future<Output = std::io::Result<std::process::ExitStatus>> + Send>>>,
+    temp_env_file: Option<PathBuf>,
+    done: bool,
+}
+
+impl Stream for NdjsonStream {
+    type Item = Result<String, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if this.done {
+            return Poll::Ready(None);
+        }
+
+        // Poll stderr first
+        if let Some(ref mut stderr) = this.stderr {
+            match Pin::new(stderr).poll_next_line(cx) {
+                Poll::Ready(Ok(Some(line))) => {
+                    let event = NdjsonEvent {
+                        event: "stderr".into(),
+                        data: Some(line),
+                        success: None,
+                        exit_code: None,
+                    };
+                    let mut json = serde_json::to_string(&event).unwrap();
+                    json.push('\n');
+                    return Poll::Ready(Some(Ok(json)));
+                }
+                Poll::Ready(Ok(None)) => {
+                    this.stderr = None;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Pending => {}
+            }
+        }
+
+        // Poll stdout
+        if let Some(ref mut stdout) = this.stdout {
+            match Pin::new(stdout).poll_next_line(cx) {
+                Poll::Ready(Ok(Some(line))) => {
+                    let event = NdjsonEvent {
+                        event: "stdout".into(),
+                        data: Some(line),
+                        success: None,
+                        exit_code: None,
+                    };
+                    let mut json = serde_json::to_string(&event).unwrap();
+                    json.push('\n');
+                    return Poll::Ready(Some(Ok(json)));
+                }
+                Poll::Ready(Ok(None)) => {
+                    this.stdout = None;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Pending => {}
+            }
+        }
+
+        // If both streams are done, wait for child exit
+        if this.stdout.is_none() && this.stderr.is_none() {
+            if let Some(ref mut fut) = this.wait_fut {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(status)) => {
+                        this.wait_fut = None;
+                        this.done = true;
+
+                        // Clean up temp env file
+                        if let Some(ref path) = this.temp_env_file {
+                            let _ = std::fs::remove_file(path);
+                        }
+
+                        let event = NdjsonEvent {
+                            event: "done".into(),
+                            data: None,
+                            success: Some(status.success()),
+                            exit_code: status.code(),
+                        };
+                        let mut json = serde_json::to_string(&event).unwrap();
+                        json.push('\n');
+                        return Poll::Ready(Some(Ok(json)));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        this.done = true;
+                        if let Some(ref path) = this.temp_env_file {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => {}
+                }
+            } else {
+                this.done = true;
+                return Poll::Ready(None);
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+fn stream_docker_compose(
+    work_dir: &Path,
+    args: &[&str],
+    file: &str,
+    env_files: &[String],
+    services: &[String],
+    temp_env_file: Option<PathBuf>,
+) -> Result<NdjsonStream> {
+    let all_env_files: Vec<&str> = env_files.iter().map(|s| s.as_str())
+        .chain(temp_env_file.as_ref().map(|p| p.to_str().unwrap()))
+        .collect();
+
+    info!(
+        command = "docker compose",
+        file = file,
+        args = ?args,
+        env_files = ?all_env_files,
+        services = ?services,
+        work_dir = %work_dir.display(),
+        "Running streaming command"
+    );
+
+    let mut cmd = AsyncCommand::new("docker");
+    cmd.args(["compose", "-f", file]);
+    for ef in &all_env_files {
+        cmd.args(["--env-file", ef]);
+    }
+    cmd.args(args);
+    for service in services {
+        cmd.arg(service);
+    }
+    cmd.current_dir(work_dir);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to execute: docker compose -f {} {} (work_dir: {})",
+            file,
+            args.join(" "),
+            work_dir.display()
+        )
+    })?;
+
+    let stdout = child.stdout.take().map(|s| BufReader::new(s).lines());
+    let stderr = child.stderr.take().map(|s| BufReader::new(s).lines());
+    let wait_fut: Pin<Box<dyn Future<Output = std::io::Result<std::process::ExitStatus>> + Send>> =
+        Box::pin(async move {
+            let mut child = child;
+            child.wait().await
+        });
+
+    Ok(NdjsonStream {
+        stdout,
+        stderr,
+        wait_fut: Some(wait_fut),
+        temp_env_file,
+        done: false,
+    })
+}
+
+// --- Handlers ---
 
 async fn compose_up(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Option<Json<ComposeRequest>>,
-) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
-        return e;
+    Json(payload): Json<ComposeRequest>,
+) -> Response {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+        return err_response(code, msg);
     }
 
-    let tag = state.current_tag.read().await.clone();
-    let Some(tag) = tag else {
-        return err(StatusCode::BAD_REQUEST, "No tag set. Call /git/checkout first.");
-    };
+    if let Err((code, msg)) = validate_tag(&state, &payload.tag).await {
+        return err_response(code, msg);
+    }
 
-    let (file, services) = body
-        .map(|b| (b.file.clone(), b.services.clone()))
-        .unwrap_or_default();
-    let file = file.unwrap_or_else(|| "docker-compose.yml".into());
+    if !payload.env.is_empty() {
+        if let Err(msg) = validate_env_vars(&payload.env) {
+            return err_response(StatusCode::BAD_REQUEST, msg);
+        }
+    }
+
+    let file = payload.file.unwrap_or_else(|| "docker-compose.yml".into());
 
     // Fetch compose file from GitHub and write to work directory
-    let content = match fetch_github_file(&state, &tag, &file).await {
+    let content = match fetch_github_file(&state, &payload.tag, &file).await {
         Ok(c) => c,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e.to_string()),
     };
 
     if let Err(e) = tokio::fs::create_dir_all(&state.work_dir).await {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create work dir: {}", e));
+        return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create work dir: {}", e));
     }
     if let Err(e) = tokio::fs::write(state.work_dir.join(&file), &content).await {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e));
+        return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e));
     }
 
-    match run_docker_compose(&state.work_dir, &["up", "-d"], &file, &state.env_files, &services) {
-        Ok(_) => {
-            *state.deployed_tag.write().await = Some(tag);
-            ok(None)
+    let temp_env_file = if !payload.env.is_empty() {
+        match write_temp_env_file(&state.work_dir, &payload.env) {
+            Ok(p) => Some(p),
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
+    } else {
+        None
+    };
+
+    let stream = match stream_docker_compose(
+        &state.work_dir,
+        &["up", "-d"],
+        &file,
+        &state.env_files,
+        &payload.services,
+        temp_env_file,
+    ) {
+        Ok(s) => s,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    *state.deployed_tag.write().await = Some(payload.tag);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
 
 async fn compose_down(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Option<Json<ComposeDownRequest>>,
-) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
-        return e;
+    Json(payload): Json<ComposeDownRequest>,
+) -> Response {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+        return err_response(code, msg);
     }
 
-    let (file, volumes, services) = body
-        .map(|b| (b.file.clone(), b.volumes, b.services.clone()))
-        .unwrap_or((None, false, vec![]));
+    if let Err((code, msg)) = validate_tag(&state, &payload.tag).await {
+        return err_response(code, msg);
+    }
 
-    let file = file.unwrap_or_else(|| "docker-compose.yml".into());
+    if !payload.env.is_empty() {
+        if let Err(msg) = validate_env_vars(&payload.env) {
+            return err_response(StatusCode::BAD_REQUEST, msg);
+        }
+    }
+
+    let file = payload.file.unwrap_or_else(|| "docker-compose.yml".into());
     let mut args = vec!["down"];
-    if volumes { args.push("-v"); }
-
-    match run_docker_compose(&state.work_dir, &args, &file, &state.env_files, &services) {
-        Ok(_) => ok(None),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
-}
-
-async fn docker_clean(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(payload): Json<CleanRequest>,
-) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
-        return e;
+    if payload.volumes {
+        args.push("-v");
     }
 
-    if !payload.volumes && !payload.images {
-        return err(StatusCode::BAD_REQUEST, "At least one of 'volumes' or 'images' must be true");
-    }
+    let temp_env_file = if !payload.env.is_empty() {
+        match write_temp_env_file(&state.work_dir, &payload.env) {
+            Ok(p) => Some(p),
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    } else {
+        None
+    };
 
-    match run_docker_prune(payload.volumes, payload.images) {
-        Ok(_) => ok(None),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
+    let stream = match stream_docker_compose(
+        &state.work_dir,
+        &args,
+        &file,
+        &state.env_files,
+        &payload.services,
+        temp_env_file,
+    ) {
+        Ok(s) => s,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
 
 async fn compose_logs(
@@ -307,6 +592,59 @@ async fn compose_logs(
     }
 }
 
+async fn docker_ps(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    match run_command("docker", &["ps", "--format", "json"]) {
+        Ok(output) => ok_output(output),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn docker_restart(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<RestartRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    info!(command = "docker restart", container = %payload.container, "Running command");
+
+    match run_command("docker", &["restart", &payload.container]) {
+        Ok(_) => ok(None),
+        Err(e) => {
+            error!(command = "docker restart", container = %payload.container, error = %e, "Command failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    }
+}
+
+async fn docker_clean(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CleanRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    if !payload.volumes && !payload.images {
+        return err(StatusCode::BAD_REQUEST, "At least one of 'volumes' or 'images' must be true");
+    }
+
+    match run_docker_prune(payload.volumes, payload.images) {
+        Ok(_) => ok(None),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let tag = state.deployed_tag.read().await.clone();
     ok(tag)
@@ -314,7 +652,29 @@ async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // --- Shell Commands ---
 
-fn run_docker_compose(work_dir: &PathBuf, args: &[&str], file: &str, env_files: &[String], services: &[String]) -> Result<String> {
+fn run_command(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to execute: {} {}", program, args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "{} {} failed (exit {}):\nstderr: {}\nstdout: {}",
+            program,
+            args.join(" "),
+            output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
+            stderr,
+            stdout
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_docker_compose(work_dir: &Path, args: &[&str], file: &str, env_files: &[String], services: &[String]) -> Result<String> {
     info!(command = "docker compose", file = file, args = ?args, env_files = ?env_files, services = ?services, work_dir = %work_dir.display(), "Running command");
     let mut cmd = Command::new("docker");
     cmd.args(["compose", "-f", file]);
@@ -354,40 +714,16 @@ fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
 
     if volumes {
         info!(command = "docker volume prune", "Running command");
-        let output = Command::new("docker")
-            .args(["volume", "prune", "-f"])
-            .output()
-            .context("Failed to execute: docker volume prune -f")?;
-        if !output.status.success() {
-            error!(command = "docker volume prune", exit_code = output.status.code(), "Command failed");
-            return Err(anyhow!(
-                "docker volume prune failed (exit {}):\nstderr: {}\nstdout: {}",
-                output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout)
-            ));
-        }
+        let result = run_command("docker", &["volume", "prune", "-f"])?;
         info!(command = "docker volume prune", "Command completed successfully");
-        output_text.push_str(&String::from_utf8_lossy(&output.stdout));
+        output_text.push_str(&result);
     }
 
     if images {
         info!(command = "docker image prune", "Running command");
-        let output = Command::new("docker")
-            .args(["image", "prune", "-af"])
-            .output()
-            .context("Failed to execute: docker image prune -af")?;
-        if !output.status.success() {
-            error!(command = "docker image prune", exit_code = output.status.code(), "Command failed");
-            return Err(anyhow!(
-                "docker image prune failed (exit {}):\nstderr: {}\nstdout: {}",
-                output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout)
-            ));
-        }
+        let result = run_command("docker", &["image", "prune", "-af"])?;
         info!(command = "docker image prune", "Command completed successfully");
-        output_text.push_str(&String::from_utf8_lossy(&output.stdout));
+        output_text.push_str(&result);
     }
 
     Ok(output_text)
@@ -435,7 +771,6 @@ async fn main() -> Result<()> {
         min_tag_age_hours,
         work_dir: PathBuf::from(work_dir),
         env_files,
-        current_tag: RwLock::new(None),
         deployed_tag: RwLock::new(None),
         http: reqwest::Client::new(),
     });
@@ -445,7 +780,8 @@ async fn main() -> Result<()> {
         .route("/compose/down", post(compose_down))
         .route("/compose/logs", post(compose_logs))
         .route("/docker/clean", post(docker_clean))
-        .route("/git/checkout", post(git_checkout))
+        .route("/docker/ps", get(docker_ps))
+        .route("/docker/restart", post(docker_restart))
         .route("/version", get(version))
         .with_state(state);
 

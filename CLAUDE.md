@@ -14,19 +14,33 @@ Single-file Rust application (`src/main.rs`) using:
 
 ## Key Components
 
-1. **AppState** - Holds configuration (token, owner/repo, work dir) and current tag (`RwLock`)
+1. **AppState** - Holds configuration (token, owner/repo, work dir) and deployed tag (`RwLock`)
 2. **Authentication** - `verify_bearer_token()` validates Authorization header
-3. **Handlers** - `compose_up`, `compose_down`, `docker_clean`, `git_checkout`, `version`
+3. **Handlers** - `compose_up`, `compose_down`, `compose_logs`, `docker_clean`, `docker_ps`, `docker_restart`, `version`
 4. **GitHub** - `get_tag_commit_date()` for tag validation, `fetch_github_file()` to download compose files from `raw.githubusercontent.com`
-5. **Shell commands** - `run_docker_compose()`, `run_docker_prune()`
+5. **Streaming** - `stream_docker_compose()` streams NDJSON events for compose up/down
+6. **Shell commands** - `run_docker_compose()`, `run_command()`, `run_docker_prune()`
 
-## Flow
+## API Endpoints
 
-1. `POST /git/checkout {"tag": "v1.0"}` — validates tag age via GitHub API, stores tag
-2. `POST /compose/up {"file": "docker-compose.yml"}` — fetches file from GitHub at stored tag, writes to work dir, runs `docker compose up -d`
-3. `POST /compose/down` — runs `docker compose down` in work dir
-4. `POST /docker/clean {"volumes": true, "images": true}` — prunes Docker resources
-5. `GET /version` — returns currently deployed tag
+1. `POST /compose/up {"tag": "v1.0", "file": "docker-compose.yml", "services": [], "env": {}}` — validates tag, fetches file from GitHub, runs `docker compose up -d`. Streams NDJSON events.
+2. `POST /compose/down {"tag": "v1.0", "file": "...", "volumes": false, "services": [], "env": {}}` — runs `docker compose down`. Streams NDJSON events.
+3. `POST /compose/logs {"file": "...", "tail": 100, "services": []}` — returns compose logs
+4. `GET /docker/ps` — returns `docker ps --format json` output
+5. `POST /docker/restart {"container": "name-or-id"}` — restarts a container
+6. `POST /docker/clean {"volumes": true, "images": true}` — prunes Docker resources
+7. `GET /version` — returns currently deployed tag
+
+## Streaming (NDJSON)
+
+`/compose/up` and `/compose/down` stream newline-delimited JSON events:
+- `{"event":"stdout","data":"..."}` — stdout line
+- `{"event":"stderr","data":"..."}` — stderr line
+- `{"event":"done","success":true,"exit_code":0}` — process completed
+
+## Per-request Environment Variables
+
+Compose up/down accept an optional `env` map. Keys must match `[A-Za-z_][A-Za-z0-9_]*`, values must not contain newlines. Written to a temp `.env` file and passed via `--env-file` to docker compose (no shell injection possible).
 
 ## Build & Run
 
