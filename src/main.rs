@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -90,6 +90,8 @@ struct ComposeRequest {
     services: Vec<String>,
     #[serde(default)]
     env: HashMap<String, String>,
+    #[serde(default)]
+    force_recreate: bool,
 }
 
 #[derive(Deserialize)]
@@ -290,6 +292,7 @@ struct NdjsonStream {
     stdout: Option<tokio::io::Lines<BufReader<tokio::process::ChildStdout>>>,
     stderr: Option<tokio::io::Lines<BufReader<tokio::process::ChildStderr>>>,
     wait_fut: Option<Pin<Box<dyn Future<Output = std::io::Result<std::process::ExitStatus>> + Send>>>,
+    pending_commands: VecDeque<AsyncCommand>,
     temp_env_file: Option<PathBuf>,
     done: bool,
 }
@@ -354,6 +357,32 @@ impl Stream for NdjsonStream {
                 match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(status)) => {
                         this.wait_fut = None;
+
+                        // If successful and more commands pending, start next
+                        if status.success() {
+                            if let Some(mut next_cmd) = this.pending_commands.pop_front() {
+                                match next_cmd.spawn() {
+                                    Ok(mut child) => {
+                                        this.stdout = child.stdout.take().map(|s| BufReader::new(s).lines());
+                                        this.stderr = child.stderr.take().map(|s| BufReader::new(s).lines());
+                                        this.wait_fut = Some(Box::pin(async move {
+                                            let mut child = child;
+                                            child.wait().await
+                                        }));
+                                        cx.waker().wake_by_ref();
+                                        return Poll::Pending;
+                                    }
+                                    Err(e) => {
+                                        this.done = true;
+                                        if let Some(ref path) = this.temp_env_file {
+                                            let _ = std::fs::remove_file(path);
+                                        }
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                }
+                            }
+                        }
+
                         this.done = true;
 
                         // Clean up temp env file
@@ -390,9 +419,35 @@ impl Stream for NdjsonStream {
     }
 }
 
-fn stream_docker_compose(
+fn build_compose_cmd(
     work_dir: &Path,
     args: &[&str],
+    file: &str,
+    env_files: &[String],
+    services: &[String],
+    temp_env_file: Option<&Path>,
+) -> AsyncCommand {
+    let mut cmd = AsyncCommand::new("docker");
+    cmd.args(["compose", "-f", file]);
+    for ef in env_files {
+        cmd.args(["--env-file", ef.as_str()]);
+    }
+    if let Some(tef) = temp_env_file {
+        cmd.args(["--env-file", tef.to_str().unwrap()]);
+    }
+    cmd.args(args);
+    for service in services {
+        cmd.arg(service);
+    }
+    cmd.current_dir(work_dir);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd
+}
+
+fn stream_docker_compose_phased(
+    work_dir: &Path,
+    phases: &[&[&str]],
     file: &str,
     env_files: &[String],
     services: &[String],
@@ -405,31 +460,24 @@ fn stream_docker_compose(
     info!(
         command = "docker compose",
         file = file,
-        args = ?args,
+        phases = ?phases,
         env_files = ?all_env_files,
         services = ?services,
         work_dir = %work_dir.display(),
         "Running streaming command"
     );
 
-    let mut cmd = AsyncCommand::new("docker");
-    cmd.args(["compose", "-f", file]);
-    for ef in &all_env_files {
-        cmd.args(["--env-file", ef]);
-    }
-    cmd.args(args);
-    for service in services {
-        cmd.arg(service);
-    }
-    cmd.current_dir(work_dir);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    let mut commands: VecDeque<AsyncCommand> = phases.iter()
+        .map(|args| build_compose_cmd(work_dir, args, file, env_files, services, temp_env_file.as_deref()))
+        .collect();
 
-    let mut child = cmd.spawn().with_context(|| {
+    let mut first_cmd = commands.pop_front()
+        .ok_or_else(|| anyhow!("no command phases specified"))?;
+
+    let mut child = first_cmd.spawn().with_context(|| {
         format!(
-            "Failed to execute: docker compose -f {} {} (work_dir: {})",
+            "Failed to execute: docker compose -f {} (work_dir: {})",
             file,
-            args.join(" "),
             work_dir.display()
         )
     })?;
@@ -446,9 +494,21 @@ fn stream_docker_compose(
         stdout,
         stderr,
         wait_fut: Some(wait_fut),
+        pending_commands: commands,
         temp_env_file,
         done: false,
     })
+}
+
+fn stream_docker_compose(
+    work_dir: &Path,
+    args: &[&str],
+    file: &str,
+    env_files: &[String],
+    services: &[String],
+    temp_env_file: Option<PathBuf>,
+) -> Result<NdjsonStream> {
+    stream_docker_compose_phased(work_dir, &[args], file, env_files, services, temp_env_file)
 }
 
 // --- Handlers ---
@@ -496,9 +556,14 @@ async fn compose_up(
         None
     };
 
-    let stream = match stream_docker_compose(
+    let mut up_args = vec!["up", "-d", "--remove-orphans"];
+    if payload.force_recreate {
+        up_args.push("--force-recreate");
+    }
+
+    let stream = match stream_docker_compose_phased(
         &state.work_dir,
-        &["up", "-d"],
+        &[&["pull"], &up_args],
         &file,
         &state.env_files,
         &payload.services,
