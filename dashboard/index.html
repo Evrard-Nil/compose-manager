@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Compose Manager Dashboard</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1117; --bg2: #161822; --bg3: #1c1f2e; --bg4: #252838;
+  --border: #2a2d3e; --text: #e0e2f0; --text2: #8b8fa3; --accent: #00b4d8;
+  --accent2: #0090b0; --danger: #e63946; --success: #4caf50; --warn: #ff9800;
+  --terminal-bg: #0a0c12; --radius: 6px;
+}
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+button { cursor: pointer; border: none; border-radius: var(--radius); font-size: 13px; padding: 6px 14px; transition: background 0.15s; }
+input, select, textarea { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); padding: 6px 10px; font-size: 13px; width: 100%; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%238b8fa3'%3E%3Cpath d='M2 4l4 4 4-4'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 8px center; padding-right: 28px; }
+
+/* Header */
+.header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.header h1 { font-size: 16px; font-weight: 600; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+.token-display { font-size: 12px; color: var(--text2); }
+
+/* Layout */
+.layout { display: flex; flex: 1; overflow: hidden; }
+
+/* Sidebar */
+.sidebar { width: 240px; background: var(--bg2); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
+.sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.sidebar-header span { font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text2); letter-spacing: 0.5px; }
+.btn-add { background: var(--accent); color: #fff; font-size: 12px; padding: 4px 10px; }
+.btn-add:hover { background: var(--accent2); }
+.instance-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+.instance-item { padding: 10px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; border-left: 3px solid transparent; transition: background 0.1s; }
+.instance-item:hover { background: var(--bg3); }
+.instance-item.active { background: var(--bg3); border-left-color: var(--accent); }
+.instance-item .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--text2); }
+.instance-item .dot.online { background: var(--success); }
+.instance-item .dot.offline { background: var(--danger); }
+.instance-item .name { font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instance-item .tag { font-size: 11px; color: var(--text2); }
+.btn-remove { background: none; color: var(--text2); font-size: 14px; padding: 0 4px; opacity: 0; transition: opacity 0.1s; }
+.instance-item:hover .btn-remove { opacity: 1; }
+.btn-remove:hover { color: var(--danger); }
+
+/* Main panel */
+.main { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.empty-state { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text2); font-size: 14px; }
+
+/* Cards */
+.card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); }
+.card-header { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text2); letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; }
+.card-body { padding: 14px; }
+
+/* Grid */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+/* Form */
+.form-group { margin-bottom: 10px; }
+.form-group label { display: block; font-size: 12px; color: var(--text2); margin-bottom: 4px; }
+.form-group:last-child { margin-bottom: 0; }
+.form-row { display: flex; gap: 8px; align-items: flex-end; }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent2); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-danger { background: var(--danger); color: #fff; }
+.btn-danger:hover { background: #c5303c; }
+.btn-sm { font-size: 11px; padding: 3px 8px; }
+.btn-ghost { background: var(--bg3); color: var(--text); border: 1px solid var(--border); }
+.btn-ghost:hover { background: var(--bg4); }
+
+/* Containers table */
+.containers-table { width: 100%; font-size: 12px; }
+.containers-table th { text-align: left; color: var(--text2); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.containers-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.containers-table tr:last-child td { border-bottom: none; }
+.status-up { color: var(--success); }
+.status-down { color: var(--danger); }
+
+/* Terminal */
+.terminal { background: var(--terminal-bg); font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; font-size: 12px; line-height: 1.5; padding: 10px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+.terminal .stdout { color: #c9d1d9; }
+.terminal .stderr { color: #f0883e; }
+.terminal .done-ok { color: var(--success); font-weight: bold; }
+.terminal .done-fail { color: var(--danger); font-weight: bold; }
+.terminal .error { color: var(--danger); }
+
+/* Logs */
+.logs-output { background: var(--terminal-bg); font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; font-size: 12px; line-height: 1.5; padding: 10px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; color: #c9d1d9; }
+
+/* Modal */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 20px; width: 400px; max-width: 90vw; }
+.modal h2 { font-size: 16px; margin-bottom: 16px; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+/* Toast */
+.toast-container { position: fixed; top: 16px; right: 16px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
+.toast { padding: 10px 16px; border-radius: var(--radius); font-size: 13px; animation: toast-in 0.2s ease; }
+.toast.error { background: var(--danger); color: #fff; }
+.toast.success { background: var(--success); color: #fff; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+
+/* Env var rows */
+.env-rows { display: flex; flex-direction: column; gap: 4px; }
+.env-row { display: flex; gap: 4px; align-items: center; }
+.env-row input { flex: 1; }
+.env-row .btn-remove-env { background: none; color: var(--text2); padding: 2px 6px; font-size: 14px; }
+.env-row .btn-remove-env:hover { color: var(--danger); }
+
+/* Checkbox */
+.checkbox-label { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.checkbox-label input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+
+/* Actions bar */
+.actions-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Compose Manager Dashboard</h1>
+  <div class="header-right">
+    <span class="token-display" id="tokenDisplay"></span>
+    <button class="btn-ghost btn-sm" onclick="promptToken()">Token</button>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <span>Instances</span>
+      <button class="btn-add" onclick="showAddModal()">+ Add</button>
+    </div>
+    <div class="instance-list" id="instanceList"></div>
+  </div>
+
+  <div class="main" id="mainPanel">
+    <div class="empty-state" id="emptyState">Select or add an instance to get started</div>
+    <div id="instancePanel" style="display:none">
+      <div class="grid-2">
+        <!-- Deploy card -->
+        <div class="card">
+          <div class="card-header">Deploy</div>
+          <div class="card-body">
+            <div class="form-group">
+              <label>Tag</label>
+              <select id="tagSelect" onchange="onTagChange()"><option value="">Loading tags...</option></select>
+            </div>
+            <div class="form-group">
+              <label>Compose File</label>
+              <select id="fileSelect"><option value="">Select a tag first</option></select>
+            </div>
+            <div class="form-group">
+              <label>Services (comma-separated, optional)</label>
+              <input id="servicesInput" placeholder="e.g. web,redis">
+            </div>
+            <div class="form-group">
+              <label>Environment Variables</label>
+              <div class="env-rows" id="envRows"></div>
+              <button class="btn-ghost btn-sm" style="margin-top:4px" onclick="addEnvRow()">+ Add Variable</button>
+            </div>
+            <div class="form-group">
+              <label class="checkbox-label"><input type="checkbox" id="forceRecreate"> Force recreate</label>
+            </div>
+            <div class="actions-bar">
+              <button class="btn-primary" id="deployBtn" onclick="deploy()">Deploy</button>
+              <button class="btn-danger" id="downBtn" onclick="composeDown()">Down</button>
+              <label class="checkbox-label"><input type="checkbox" id="downVolumes"> Remove volumes</label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Status card -->
+        <div class="card">
+          <div class="card-header">
+            Status
+            <button class="btn-ghost btn-sm" onclick="refreshStatus()">Refresh</button>
+          </div>
+          <div class="card-body">
+            <div style="margin-bottom:10px;font-size:13px">
+              Deployed tag: <strong id="deployedTag">-</strong>
+            </div>
+            <div id="containersSection">
+              <table class="containers-table">
+                <thead><tr><th>Container</th><th>Image</th><th>Status</th><th></th></tr></thead>
+                <tbody id="containersTbody"><tr><td colspan="4" style="color:var(--text2)">Loading...</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Terminal card -->
+      <div class="card">
+        <div class="card-header">
+          Output
+          <button class="btn-ghost btn-sm" onclick="clearTerminal()">Clear</button>
+        </div>
+        <div class="terminal" id="terminal"></div>
+      </div>
+
+      <!-- Logs card -->
+      <div class="card">
+        <div class="card-header">
+          Logs
+          <div style="display:flex;gap:6px;align-items:center">
+            <label class="checkbox-label" style="font-size:11px"><input type="checkbox" id="autoRefreshLogs" onchange="toggleAutoRefresh()"> Auto</label>
+            <button class="btn-ghost btn-sm" onclick="loadLogs()">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" style="padding:8px 14px">
+          <div class="form-row" style="margin-bottom:8px">
+            <div class="form-group" style="flex:1;margin:0"><label>Tail</label><input id="logsTail" type="number" value="100" style="width:80px"></div>
+            <div class="form-group" style="flex:2;margin:0"><label>Services</label><input id="logsServices" placeholder="optional, comma-separated"></div>
+          </div>
+        </div>
+        <div class="logs-output" id="logsOutput">Click "Refresh" to load logs</div>
+      </div>
+
+      <!-- Docker clean card -->
+      <div class="card">
+        <div class="card-header">Docker Cleanup</div>
+        <div class="card-body">
+          <div class="actions-bar">
+            <label class="checkbox-label"><input type="checkbox" id="cleanVolumes"> Prune volumes</label>
+            <label class="checkbox-label"><input type="checkbox" id="cleanImages" checked> Prune images</label>
+            <button class="btn-danger btn-sm" onclick="dockerClean()">Clean</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+<div id="modalRoot"></div>
+
+<script>
+// --- State ---
+let token = localStorage.getItem('dashboard_token') || '';
+let instances = [];
+let selectedId = null;
+let statusTimers = {};
+let autoRefreshTimer = null;
+
+// --- Init ---
+document.addEventListener('DOMContentLoaded', () => {
+  if (!token) { promptToken(); return; }
+  updateTokenDisplay();
+  loadInstances();
+});
+
+function updateTokenDisplay() {
+  document.getElementById('tokenDisplay').textContent = token ? `Token: ${token.slice(0, 4)}...` : '';
+}
+
+function promptToken() {
+  showModal('Dashboard Token', `
+    <div class="form-group">
+      <label>Bearer Token</label>
+      <input id="modalToken" type="password" value="${token}" placeholder="Enter dashboard token">
+    </div>
+  `, () => {
+    token = document.getElementById('modalToken').value.trim();
+    localStorage.setItem('dashboard_token', token);
+    updateTokenDisplay();
+    hideModal();
+    loadInstances();
+  });
+}
+
+// --- API ---
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Authorization': `Bearer ${token}` } };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const resp = await fetch(path, opts);
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: resp.statusText }));
+    throw new Error(err.error || err.message || resp.statusText);
+  }
+  return resp;
+}
+
+async function apiJson(method, path, body) {
+  const resp = await api(method, path, body);
+  return resp.json();
+}
+
+// --- NDJSON Stream ---
+async function streamNdjson(method, path, body, onEvent) {
+  const resp = await fetch(path, {
+    method,
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: resp.statusText }));
+    onEvent({ event: 'error', data: err.error || resp.statusText });
+    return;
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.trim()) {
+        try { onEvent(JSON.parse(line)); } catch(e) { onEvent({ event: 'stderr', data: line }); }
+      }
+    }
+  }
+  if (buffer.trim()) {
+    try { onEvent(JSON.parse(buffer)); } catch(e) { onEvent({ event: 'stderr', data: buffer }); }
+  }
+}
+
+// --- Instances ---
+async function loadInstances() {
+  try {
+    instances = await apiJson('GET', '/api/instances');
+    renderSidebar();
+    startStatusPolling();
+  } catch(e) {
+    toast('Failed to load instances: ' + e.message, 'error');
+  }
+}
+
+function renderSidebar() {
+  const el = document.getElementById('instanceList');
+  if (!instances.length) {
+    el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text2);font-size:13px">No instances yet</div>';
+    return;
+  }
+  el.innerHTML = instances.map(i => `
+    <div class="instance-item ${i.id === selectedId ? 'active' : ''}" onclick="selectInstance('${i.id}')">
+      <div class="dot ${i._status || ''}" id="dot-${i.id}"></div>
+      <div class="name">${esc(i.name)}</div>
+      <div class="tag" id="tag-${i.id}">${i._deployedTag || ''}</div>
+      <button class="btn-remove" onclick="event.stopPropagation();removeInstance('${i.id}')" title="Remove">&times;</button>
+    </div>
+  `).join('');
+}
+
+async function selectInstance(id) {
+  selectedId = id;
+  renderSidebar();
+  document.getElementById('emptyState').style.display = 'none';
+  document.getElementById('instancePanel').style.display = '';
+  clearTerminal();
+  document.getElementById('logsOutput').textContent = 'Click "Refresh" to load logs';
+  loadTags();
+  refreshStatus();
+}
+
+function showAddModal() {
+  showModal('Add Instance', `
+    <div class="form-group"><label>Name</label><input id="addName" placeholder="e.g. GPU-30"></div>
+    <div class="form-group"><label>URL</label><input id="addUrl" placeholder="http://192.168.1.10:8080"></div>
+    <div class="form-group"><label>Bearer Token</label><input id="addToken" type="password" placeholder="Instance bearer token"></div>
+    <div class="form-group"><label>GitHub Repo</label><input id="addRepo" placeholder="https://github.com/owner/repo"></div>
+  `, async () => {
+    const name = document.getElementById('addName').value.trim();
+    const url = document.getElementById('addUrl').value.trim();
+    const bearer_token = document.getElementById('addToken').value.trim();
+    const github_repo = document.getElementById('addRepo').value.trim();
+    if (!name || !url || !bearer_token || !github_repo) { toast('All fields required', 'error'); return; }
+    try {
+      await apiJson('POST', '/api/instances', { name, url, bearer_token, github_repo });
+      hideModal();
+      await loadInstances();
+      toast('Instance added', 'success');
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+async function removeInstance(id) {
+  const inst = instances.find(i => i.id === id);
+  if (!confirm(`Remove "${inst?.name || id}"?`)) return;
+  try {
+    await api('DELETE', `/api/instances/${id}`);
+    if (selectedId === id) {
+      selectedId = null;
+      document.getElementById('emptyState').style.display = '';
+      document.getElementById('instancePanel').style.display = 'none';
+    }
+    await loadInstances();
+    toast('Instance removed', 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- Status polling ---
+function startStatusPolling() {
+  Object.values(statusTimers).forEach(clearInterval);
+  statusTimers = {};
+  for (const inst of instances) {
+    checkInstanceStatus(inst.id);
+    statusTimers[inst.id] = setInterval(() => checkInstanceStatus(inst.id), 30000);
+  }
+}
+
+async function checkInstanceStatus(id) {
+  try {
+    const data = await apiJson('GET', `/api/instances/${id}/version`);
+    const inst = instances.find(i => i.id === id);
+    if (inst) {
+      inst._status = 'online';
+      inst._deployedTag = data.tag || '-';
+    }
+    const dot = document.getElementById(`dot-${id}`);
+    if (dot) { dot.className = 'dot online'; }
+    const tag = document.getElementById(`tag-${id}`);
+    if (tag) { tag.textContent = data.tag || ''; }
+  } catch {
+    const inst = instances.find(i => i.id === id);
+    if (inst) { inst._status = 'offline'; inst._deployedTag = ''; }
+    const dot = document.getElementById(`dot-${id}`);
+    if (dot) { dot.className = 'dot offline'; }
+    const tag = document.getElementById(`tag-${id}`);
+    if (tag) { tag.textContent = ''; }
+  }
+}
+
+// --- GitHub ---
+async function loadTags() {
+  const inst = instances.find(i => i.id === selectedId);
+  if (!inst) return;
+  const sel = document.getElementById('tagSelect');
+  sel.innerHTML = '<option value="">Loading tags...</option>';
+  try {
+    const repo = inst.github_repo;
+    const tags = await apiJson('GET', `/api/github/tags?repo=${encodeURIComponent(repo)}`);
+    if (!tags.length) {
+      sel.innerHTML = '<option value="">No tags found</option>';
+      return;
+    }
+    sel.innerHTML = '<option value="">Select a tag</option>' + tags.map(t => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
+  } catch(e) {
+    sel.innerHTML = '<option value="">Failed to load tags</option>';
+    toast('Failed to load tags: ' + e.message, 'error');
+  }
+}
+
+async function onTagChange() {
+  const tag = document.getElementById('tagSelect').value;
+  const sel = document.getElementById('fileSelect');
+  if (!tag) { sel.innerHTML = '<option value="">Select a tag first</option>'; return; }
+  const inst = instances.find(i => i.id === selectedId);
+  if (!inst) return;
+  sel.innerHTML = '<option value="">Loading files...</option>';
+  try {
+    const files = await apiJson('GET', `/api/github/files?repo=${encodeURIComponent(inst.github_repo)}&tag=${encodeURIComponent(tag)}`);
+    if (!files.length) {
+      sel.innerHTML = '<option value="">No compose files found</option>';
+      return;
+    }
+    sel.innerHTML = files.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
+  } catch(e) {
+    sel.innerHTML = '<option value="">Failed to load files</option>';
+    toast('Failed to load files: ' + e.message, 'error');
+  }
+}
+
+// --- Deploy ---
+function getServices() {
+  return document.getElementById('servicesInput').value.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function getEnvVars() {
+  const env = {};
+  document.querySelectorAll('#envRows .env-row').forEach(row => {
+    const k = row.querySelector('.env-key').value.trim();
+    const v = row.querySelector('.env-val').value;
+    if (k) env[k] = v;
+  });
+  return env;
+}
+
+function addEnvRow(key, val) {
+  const container = document.getElementById('envRows');
+  const row = document.createElement('div');
+  row.className = 'env-row';
+  row.innerHTML = `
+    <input class="env-key" placeholder="KEY" value="${esc(key || '')}" style="flex:1">
+    <input class="env-val" placeholder="value" value="${esc(val || '')}" style="flex:2">
+    <button class="btn-remove-env" onclick="this.parentElement.remove()">&times;</button>
+  `;
+  container.appendChild(row);
+}
+
+async function deploy() {
+  const tag = document.getElementById('tagSelect').value;
+  const file = document.getElementById('fileSelect').value;
+  if (!tag || !file) { toast('Select tag and file', 'error'); return; }
+
+  const body = {
+    tag, file,
+    services: getServices(),
+    env: getEnvVars(),
+    force_recreate: document.getElementById('forceRecreate').checked,
+  };
+
+  clearTerminal();
+  setDeploying(true);
+  appendTerminal(`> Deploying ${tag} / ${file}...\n`, 'stdout');
+
+  try {
+    await streamNdjson('POST', `/api/instances/${selectedId}/compose/up`, body, handleStreamEvent);
+  } catch(e) {
+    appendTerminal(`Error: ${e.message}\n`, 'error');
+  }
+  setDeploying(false);
+  refreshStatus();
+}
+
+async function composeDown() {
+  const tag = document.getElementById('tagSelect').value;
+  const file = document.getElementById('fileSelect').value;
+  if (!tag) { toast('Select a tag', 'error'); return; }
+
+  const body = {
+    tag,
+    file: file || undefined,
+    volumes: document.getElementById('downVolumes').checked,
+    services: getServices(),
+    env: getEnvVars(),
+  };
+
+  clearTerminal();
+  setDeploying(true);
+  appendTerminal(`> Compose down...\n`, 'stdout');
+
+  try {
+    await streamNdjson('POST', `/api/instances/${selectedId}/compose/down`, body, handleStreamEvent);
+  } catch(e) {
+    appendTerminal(`Error: ${e.message}\n`, 'error');
+  }
+  setDeploying(false);
+  refreshStatus();
+}
+
+function handleStreamEvent(ev) {
+  if (ev.event === 'stdout') appendTerminal(ev.data + '\n', 'stdout');
+  else if (ev.event === 'stderr') appendTerminal(ev.data + '\n', 'stderr');
+  else if (ev.event === 'done') {
+    if (ev.success) appendTerminal(`Done (exit ${ev.exit_code})\n`, 'done-ok');
+    else appendTerminal(`Failed (exit ${ev.exit_code})\n`, 'done-fail');
+  }
+  else if (ev.event === 'error') appendTerminal(`Error: ${ev.data}\n`, 'error');
+}
+
+function setDeploying(on) {
+  document.getElementById('deployBtn').disabled = on;
+  document.getElementById('downBtn').disabled = on;
+}
+
+// --- Status ---
+async function refreshStatus() {
+  if (!selectedId) return;
+  try {
+    const ver = await apiJson('GET', `/api/instances/${selectedId}/version`);
+    document.getElementById('deployedTag').textContent = ver.tag || '-';
+  } catch(e) {
+    document.getElementById('deployedTag').textContent = 'offline';
+  }
+
+  try {
+    const ps = await apiJson('GET', `/api/instances/${selectedId}/docker/ps`);
+    const output = ps.output || '';
+    const containers = output.trim().split('\n').filter(Boolean).map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+
+    const tbody = document.getElementById('containersTbody');
+    if (!containers.length) {
+      tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text2)">No containers running</td></tr>';
+      return;
+    }
+    tbody.innerHTML = containers.map(c => {
+      const up = (c.Status || c.State || '').toLowerCase().includes('up');
+      return `<tr>
+        <td>${esc(c.Names || c.Name || '')}</td>
+        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(c.Image || '')}</td>
+        <td class="${up ? 'status-up' : 'status-down'}">${esc(c.Status || c.State || '')}</td>
+        <td><button class="btn-ghost btn-sm" onclick="restartContainer('${esc(c.Names || c.Name || '')}')">Restart</button></td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('containersTbody').innerHTML = `<tr><td colspan="4" style="color:var(--danger)">${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function restartContainer(name) {
+  if (!confirm(`Restart "${name}"?`)) return;
+  try {
+    await apiJson('POST', `/api/instances/${selectedId}/docker/restart`, { container: name });
+    toast(`Restarted ${name}`, 'success');
+    refreshStatus();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- Logs ---
+async function loadLogs() {
+  if (!selectedId) return;
+  const tail = parseInt(document.getElementById('logsTail').value) || 100;
+  const services = document.getElementById('logsServices').value.split(',').map(s => s.trim()).filter(Boolean);
+  const file = document.getElementById('fileSelect').value || undefined;
+  const el = document.getElementById('logsOutput');
+  el.textContent = 'Loading...';
+  try {
+    const data = await apiJson('POST', `/api/instances/${selectedId}/compose/logs`, { file, tail, services });
+    el.textContent = data.output || '(empty)';
+    el.scrollTop = el.scrollHeight;
+  } catch(e) {
+    el.textContent = 'Error: ' + e.message;
+  }
+}
+
+function toggleAutoRefresh() {
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+  if (document.getElementById('autoRefreshLogs').checked) {
+    loadLogs();
+    autoRefreshTimer = setInterval(loadLogs, 10000);
+  }
+}
+
+// --- Docker clean ---
+async function dockerClean() {
+  const volumes = document.getElementById('cleanVolumes').checked;
+  const images = document.getElementById('cleanImages').checked;
+  if (!volumes && !images) { toast('Select at least one option', 'error'); return; }
+  if (!confirm('Run docker prune? This cannot be undone.')) return;
+  try {
+    await apiJson('POST', `/api/instances/${selectedId}/docker/clean`, { volumes, images });
+    toast('Docker cleanup complete', 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- Terminal ---
+function appendTerminal(text, cls) {
+  const el = document.getElementById('terminal');
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = text;
+  el.appendChild(span);
+  el.scrollTop = el.scrollHeight;
+}
+
+function clearTerminal() {
+  document.getElementById('terminal').innerHTML = '';
+}
+
+// --- Modal ---
+function showModal(title, bodyHtml, onConfirm) {
+  const root = document.getElementById('modalRoot');
+  root.innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this)hideModal()">
+      <div class="modal">
+        <h2>${title}</h2>
+        ${bodyHtml}
+        <div class="modal-actions">
+          <button class="btn-ghost" onclick="hideModal()">Cancel</button>
+          <button class="btn-primary" id="modalConfirm">Confirm</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById('modalConfirm').onclick = onConfirm;
+  // Focus first input
+  const first = root.querySelector('input');
+  if (first) setTimeout(() => first.focus(), 50);
+}
+
+function hideModal() {
+  document.getElementById('modalRoot').innerHTML = '';
+}
+
+// --- Toast ---
+function toast(msg, type) {
+  const container = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  container.appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+// --- Util ---
+function esc(s) {
+  if (!s) return '';
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+</script>
+</body>
+</html>
