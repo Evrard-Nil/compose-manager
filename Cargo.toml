@@ -15,3 +15,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 futures = "0.3"
 tokio-stream = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+dstack-sdk-types = { git = "https://github.com/Dstack-TEE/dstack" }
+http-client-unix-domain-socket = "0.1.1"

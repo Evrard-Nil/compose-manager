@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -10,6 +10,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -26,7 +27,124 @@ use tokio::{
 };
 use tracing::{error, info};
 
+// --- Vendored dstack client (lightweight, avoids pulling in alloy) ---
+// Based on dstack-sdk 0.1.2, same pattern as tee-attestation-server
+
+mod dstack {
+    use anyhow::Result;
+    use dstack_sdk_types::dstack::GetQuoteResponse;
+    use hex::encode as hex_encode;
+    use http_client_unix_domain_socket::{ClientUnix, Method};
+    use reqwest::Client;
+    use serde::{de::DeserializeOwned, Serialize};
+    use serde_json::{json, Value};
+    use std::env;
+
+    #[derive(Debug)]
+    enum ClientKind {
+        Http,
+        Unix,
+    }
+
+    fn get_endpoint() -> String {
+        if let Ok(sim_endpoint) = env::var("DSTACK_SIMULATOR_ENDPOINT") {
+            return sim_endpoint;
+        }
+        const SOCKET_PATHS: &[&str] = &["/var/run/dstack/dstack.sock", "/var/run/dstack.sock"];
+        for path in SOCKET_PATHS {
+            if std::path::Path::new(path).exists() {
+                return path.to_string();
+            }
+        }
+        SOCKET_PATHS[0].to_string()
+    }
+
+    pub struct DstackClient {
+        base_url: String,
+        endpoint: String,
+        client: ClientKind,
+    }
+
+    impl DstackClient {
+        pub fn new() -> Self {
+            let endpoint = get_endpoint();
+            let (base_url, client) = match endpoint {
+                ref e if e.starts_with("http://") || e.starts_with("https://") => {
+                    (e.to_string(), ClientKind::Http)
+                }
+                _ => ("http://localhost".to_string(), ClientKind::Unix),
+            };
+            DstackClient {
+                base_url,
+                endpoint,
+                client,
+            }
+        }
+
+        async fn send_rpc_request<S: Serialize, D: DeserializeOwned>(
+            &self,
+            path: &str,
+            payload: &S,
+        ) -> Result<D> {
+            match &self.client {
+                ClientKind::Http => {
+                    let client = Client::new();
+                    let url = format!(
+                        "{}/{}",
+                        self.base_url.trim_end_matches('/'),
+                        path.trim_start_matches('/')
+                    );
+                    let res = client
+                        .post(&url)
+                        .json(payload)
+                        .header("Content-Type", "application/json")
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok(res.json().await?)
+                }
+                ClientKind::Unix => {
+                    let mut unix_client = ClientUnix::try_new(&self.endpoint).await?;
+                    let res = unix_client
+                        .send_request_json::<_, _, Value>(
+                            path,
+                            Method::POST,
+                            &[("Content-Type", "application/json"), ("Host", "dstack")],
+                            Some(payload),
+                        )
+                        .await?;
+                    Ok(res.1)
+                }
+            }
+        }
+
+        pub async fn get_quote(&self, report_data: Vec<u8>) -> Result<GetQuoteResponse> {
+            if report_data.is_empty() || report_data.len() > 64 {
+                anyhow::bail!("invalid report data length");
+            }
+            let hex_data = hex_encode(&report_data);
+            let data = json!({ "report_data": hex_data });
+            let response: Value = self.send_rpc_request("/GetQuote", &data).await?;
+            Ok(serde_json::from_value::<GetQuoteResponse>(response)?)
+        }
+    }
+}
+
 // --- Application State ---
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DeploymentAction {
+    timestamp: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    services: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container: Option<String>,
+}
 
 struct AppState {
     bearer_token: String,
@@ -36,6 +154,7 @@ struct AppState {
     work_dir: PathBuf,
     env_files: Vec<String>,
     deployed_tag: RwLock<Option<String>>,
+    actions: RwLock<Vec<DeploymentAction>>,
     http: reqwest::Client,
 }
 
@@ -573,6 +692,14 @@ async fn compose_up(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
+    state.actions.write().await.push(DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: "compose_up".into(),
+        tag: Some(payload.tag.clone()),
+        file: Some(file.clone()),
+        services: payload.services,
+        container: None,
+    });
     *state.deployed_tag.write().await = Some(payload.tag);
 
     Response::builder()
@@ -627,6 +754,15 @@ async fn compose_down(
         Ok(s) => s,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+
+    state.actions.write().await.push(DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: "compose_down".into(),
+        tag: Some(payload.tag),
+        file: Some(file),
+        services: payload.services,
+        container: None,
+    });
 
     Response::builder()
         .status(StatusCode::OK)
@@ -683,7 +819,17 @@ async fn docker_restart(
     info!(command = "docker restart", container = %payload.container, "Running command");
 
     match run_command("docker", &["restart", &payload.container]) {
-        Ok(_) => ok(None),
+        Ok(_) => {
+            state.actions.write().await.push(DeploymentAction {
+                timestamp: Utc::now().to_rfc3339(),
+                action: "docker_restart".into(),
+                tag: None,
+                file: None,
+                services: vec![],
+                container: Some(payload.container),
+            });
+            ok(None)
+        }
         Err(e) => {
             error!(command = "docker restart", container = %payload.container, error = %e, "Command failed");
             err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -705,9 +851,113 @@ async fn docker_clean(
     }
 
     match run_docker_prune(payload.volumes, payload.images) {
-        Ok(_) => ok(None),
+        Ok(_) => {
+            state.actions.write().await.push(DeploymentAction {
+                timestamp: Utc::now().to_rfc3339(),
+                action: "docker_clean".into(),
+                tag: None,
+                file: None,
+                services: vec![],
+                container: None,
+            });
+            ok(None)
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+// --- Attestation ---
+
+#[derive(Deserialize)]
+struct AttestationQuery {
+    nonce: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AttestationResponse {
+    actions: Vec<DeploymentAction>,
+    actions_hash: String,
+    nonce: String,
+    nonce_source: String,
+    quote: String,
+    event_log: String,
+    report_data: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    vm_config: String,
+}
+
+fn parse_nonce(nonce: Option<&str>) -> Result<([u8; 32], &'static str), (StatusCode, String)> {
+    match nonce {
+        Some(hex_str) => {
+            let bytes = hex::decode(hex_str).map_err(|_| {
+                (StatusCode::BAD_REQUEST, "nonce must be hex-encoded".into())
+            })?;
+            if bytes.len() != 32 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "nonce must be exactly 32 bytes (64 hex chars)".into(),
+                ));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Ok((arr, "client"))
+        }
+        None => {
+            use rand::RngCore;
+            let mut arr = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut arr);
+            Ok((arr, "server"))
+        }
+    }
+}
+
+async fn attestation_report(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AttestationQuery>,
+) -> Response {
+    let (nonce_bytes, nonce_source) = match parse_nonce(query.nonce.as_deref()) {
+        Ok(v) => v,
+        Err((code, msg)) => return err_response(code, msg),
+    };
+    let nonce_hex = hex::encode(nonce_bytes);
+
+    let actions = state.actions.read().await.clone();
+
+    let actions_json = serde_json::to_string(&actions).unwrap();
+    let actions_hash: [u8; 32] = sha2::Sha256::digest(actions_json.as_bytes()).into();
+    let actions_hash_hex = hex::encode(actions_hash);
+
+    let mut report_data = vec![0u8; 64];
+    report_data[..32].copy_from_slice(&actions_hash);
+    report_data[32..64].copy_from_slice(&nonce_bytes);
+
+    let client = dstack::DstackClient::new();
+    let quote_response = match client.get_quote(report_data).await {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("dstack unavailable: {e}"),
+            )
+        }
+    };
+
+    let resp = AttestationResponse {
+        actions,
+        actions_hash: actions_hash_hex,
+        nonce: nonce_hex,
+        nonce_source: nonce_source.into(),
+        quote: quote_response.quote,
+        event_log: quote_response.event_log,
+        report_data: quote_response.report_data,
+        vm_config: quote_response.vm_config,
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&resp).unwrap()))
+        .unwrap()
 }
 
 async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -837,6 +1087,7 @@ async fn main() -> Result<()> {
         work_dir: PathBuf::from(work_dir),
         env_files,
         deployed_tag: RwLock::new(None),
+        actions: RwLock::new(Vec::new()),
         http: reqwest::Client::new(),
     });
 
@@ -847,6 +1098,7 @@ async fn main() -> Result<()> {
         .route("/docker/clean", post(docker_clean))
         .route("/docker/ps", get(docker_ps))
         .route("/docker/restart", post(docker_restart))
+        .route("/v1/attestation/report", get(attestation_report))
         .route("/version", get(version))
         .with_state(state);
 
