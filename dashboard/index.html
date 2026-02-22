@@ -247,6 +247,7 @@ let instances = [];
 let selectedId = null;
 let statusTimers = {};
 let autoRefreshTimer = null;
+const MAX_TERMINAL_LINES = 1000;
 
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {
@@ -511,16 +512,19 @@ async function deploy() {
     force_recreate: document.getElementById('forceRecreate').checked,
   };
 
+  const targetId = selectedId;
   clearTerminal();
   setDeploying(true);
   appendTerminal(`> Deploying ${tag} / ${file}...\n`, 'stdout');
 
   try {
-    await streamNdjson('POST', `/api/instances/${selectedId}/compose/up`, body, handleStreamEvent);
+    await streamNdjson('POST', `/api/instances/${targetId}/compose/up`, body, ev => {
+      if (selectedId === targetId) handleStreamEvent(ev);
+    });
   } catch(e) {
-    appendTerminal(`Error: ${e.message}\n`, 'error');
+    if (selectedId === targetId) appendTerminal(`Error: ${e.message}\n`, 'error');
   }
-  setDeploying(false);
+  if (selectedId === targetId) setDeploying(false);
   refreshStatus();
 }
 
@@ -537,16 +541,19 @@ async function composeDown() {
     env: getEnvVars(),
   };
 
+  const targetId = selectedId;
   clearTerminal();
   setDeploying(true);
   appendTerminal(`> Compose down...\n`, 'stdout');
 
   try {
-    await streamNdjson('POST', `/api/instances/${selectedId}/compose/down`, body, handleStreamEvent);
+    await streamNdjson('POST', `/api/instances/${targetId}/compose/down`, body, ev => {
+      if (selectedId === targetId) handleStreamEvent(ev);
+    });
   } catch(e) {
-    appendTerminal(`Error: ${e.message}\n`, 'error');
+    if (selectedId === targetId) appendTerminal(`Error: ${e.message}\n`, 'error');
   }
-  setDeploying(false);
+  if (selectedId === targetId) setDeploying(false);
   refreshStatus();
 }
 
@@ -654,6 +661,9 @@ function appendTerminal(text, cls) {
   span.className = cls;
   span.textContent = text;
   el.appendChild(span);
+  while (el.childNodes.length > MAX_TERMINAL_LINES) {
+    el.removeChild(el.firstChild);
+  }
   el.scrollTop = el.scrollHeight;
 }
 
