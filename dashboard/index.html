@@ -247,7 +247,8 @@ let instances = [];
 let selectedId = null;
 let statusTimers = {};
 let autoRefreshTimer = null;
-const MAX_TERMINAL_LINES = 1000;
+let terminalSize = 0;
+const MAX_TERMINAL_BYTES = 200000;
 
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {
@@ -661,7 +662,9 @@ function appendTerminal(text, cls) {
   span.className = cls;
   span.textContent = text;
   el.appendChild(span);
-  while (el.childNodes.length > MAX_TERMINAL_LINES) {
+  terminalSize += text.length;
+  while (el.childNodes.length > 1 && terminalSize > MAX_TERMINAL_BYTES) {
+    terminalSize -= el.firstChild.textContent.length;
     el.removeChild(el.firstChild);
   }
   el.scrollTop = el.scrollHeight;
@@ -669,6 +672,7 @@ function appendTerminal(text, cls) {
 
 function clearTerminal() {
   document.getElementById('terminal').innerHTML = '';
+  terminalSize = 0;
 }
 
 // --- Modal ---
