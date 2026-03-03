@@ -682,7 +682,7 @@ async fn compose_up(
 
     let stream = match stream_docker_compose_phased(
         &state.work_dir,
-        &[&["pull"], &up_args],
+        &[&["pull", "--ignore-buildable"], &["build"], &up_args],
         &file,
         &state.env_files,
         &payload.services,
