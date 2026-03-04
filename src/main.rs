@@ -154,6 +154,7 @@ struct AppState {
     work_dir: PathBuf,
     env_files: Vec<String>,
     deployed_tag: RwLock<Option<String>>,
+    deployed_file: RwLock<Option<String>>,
     actions: RwLock<Vec<DeploymentAction>>,
     http: reqwest::Client,
 }
@@ -166,6 +167,8 @@ struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -174,21 +177,22 @@ struct StatusResponse {
 type ApiResult = (StatusCode, Json<StatusResponse>);
 
 fn ok(tag: Option<String>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, output: None, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, file: None, output: None, error: None }))
 }
 
 fn ok_output(output: String) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, output: Some(output), error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, file: None, output: Some(output), error: None }))
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
-    (code, Json(StatusResponse { status: "error".into(), tag: None, output: None, error: Some(msg.into()) }))
+    (code, Json(StatusResponse { status: "error".into(), tag: None, file: None, output: None, error: Some(msg.into()) }))
 }
 
 fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
     let body = serde_json::to_string(&StatusResponse {
         status: "error".into(),
         tag: None,
+        file: None,
         output: None,
         error: Some(msg.into()),
     })
@@ -280,7 +284,10 @@ fn validate_env_vars(env: &HashMap<String, String>) -> Result<(), String> {
 }
 
 fn write_temp_env_file(work_dir: &Path, env: &HashMap<String, String>) -> Result<PathBuf> {
-    let path = work_dir.join(".env.tmp");
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let path = work_dir.join(format!(".env.tmp.{}", hex::encode(bytes)));
     let content: String = env
         .iter()
         .map(|(k, v)| format!("{}={}", k, v))
@@ -701,6 +708,7 @@ async fn compose_up(
         container: None,
     });
     *state.deployed_tag.write().await = Some(payload.tag);
+    *state.deployed_file.write().await = Some(file);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -962,7 +970,8 @@ async fn attestation_report(
 
 async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let tag = state.deployed_tag.read().await.clone();
-    ok(tag)
+    let file = state.deployed_file.read().await.clone();
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, file, output: None, error: None }))
 }
 
 // --- Shell Commands ---
@@ -1087,6 +1096,7 @@ async fn main() -> Result<()> {
         work_dir: PathBuf::from(work_dir),
         env_files,
         deployed_tag: RwLock::new(None),
+        deployed_file: RwLock::new(None),
         actions: RwLock::new(Vec::new()),
         http: reqwest::Client::new(),
     });
