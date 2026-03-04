@@ -139,7 +139,11 @@ struct DeploymentAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_sha256: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     services: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,7 +158,9 @@ struct AppState {
     work_dir: PathBuf,
     env_files: Vec<String>,
     deployed_tag: RwLock<Option<String>>,
+    deployed_commit: RwLock<Option<String>>,
     deployed_file: RwLock<Option<String>>,
+    deployed_file_sha256: RwLock<Option<String>>,
     actions: RwLock<Vec<DeploymentAction>>,
     http: reqwest::Client,
 }
@@ -167,7 +173,11 @@ struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,22 +187,24 @@ struct StatusResponse {
 type ApiResult = (StatusCode, Json<StatusResponse>);
 
 fn ok(tag: Option<String>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, file: None, output: None, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, error: None }))
 }
 
 fn ok_output(output: String) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, file: None, output: Some(output), error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), error: None }))
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
-    (code, Json(StatusResponse { status: "error".into(), tag: None, file: None, output: None, error: Some(msg.into()) }))
+    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, error: Some(msg.into()) }))
 }
 
 fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
     let body = serde_json::to_string(&StatusResponse {
         status: "error".into(),
         tag: None,
+        commit: None,
         file: None,
+        file_sha256: None,
         output: None,
         error: Some(msg.into()),
     })
@@ -301,6 +313,7 @@ fn write_temp_env_file(work_dir: &Path, env: &HashMap<String, String>) -> Result
 
 #[derive(Deserialize)]
 struct GitHubCommit {
+    sha: String,
     commit: GitHubCommitDetail,
 }
 
@@ -314,7 +327,12 @@ struct GitHubCommitter {
     date: DateTime<Utc>,
 }
 
-async fn get_tag_commit_date(state: &AppState, tag: &str) -> Result<DateTime<Utc>> {
+struct TagInfo {
+    commit_date: DateTime<Utc>,
+    commit_sha: String,
+}
+
+async fn get_tag_info(state: &AppState, tag: &str) -> Result<TagInfo> {
     let url = format!(
         "https://api.github.com/repos/{}/{}/commits/{}",
         state.github_owner, state.github_repo_name, tag
@@ -332,11 +350,14 @@ async fn get_tag_commit_date(state: &AppState, tag: &str) -> Result<DateTime<Utc
     let commit: GitHubCommit = resp.json().await
         .context("Failed to parse GitHub response")?;
 
-    Ok(commit.commit.committer.date)
+    Ok(TagInfo {
+        commit_date: commit.commit.committer.date,
+        commit_sha: commit.sha,
+    })
 }
 
-async fn validate_tag(state: &AppState, tag: &str) -> Result<(), (StatusCode, String)> {
-    let commit_date = get_tag_commit_date(state, tag).await.map_err(|e| {
+async fn validate_tag(state: &AppState, tag: &str) -> Result<TagInfo, (StatusCode, String)> {
+    let tag_info = get_tag_info(state, tag).await.map_err(|e| {
         let code = if e.to_string().contains("not found") {
             StatusCode::BAD_REQUEST
         } else {
@@ -346,14 +367,14 @@ async fn validate_tag(state: &AppState, tag: &str) -> Result<(), (StatusCode, St
     })?;
 
     let min_age = Utc::now() - chrono::Duration::hours(state.min_tag_age_hours);
-    if commit_date > min_age {
+    if tag_info.commit_date > min_age {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("tag too recent: {} is less than {} hours old", commit_date, state.min_tag_age_hours),
+            format!("tag too recent: {} is less than {} hours old", tag_info.commit_date, state.min_tag_age_hours),
         ));
     }
 
-    Ok(())
+    Ok(tag_info)
 }
 
 async fn fetch_github_file(state: &AppState, tag: &str, path: &str) -> Result<String> {
@@ -648,9 +669,10 @@ async fn compose_up(
         return err_response(code, msg);
     }
 
-    if let Err((code, msg)) = validate_tag(&state, &payload.tag).await {
-        return err_response(code, msg);
-    }
+    let tag_info = match validate_tag(&state, &payload.tag).await {
+        Ok(info) => info,
+        Err((code, msg)) => return err_response(code, msg),
+    };
 
     if !payload.env.is_empty() {
         if let Err(msg) = validate_env_vars(&payload.env) {
@@ -665,6 +687,8 @@ async fn compose_up(
         Ok(c) => c,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, e.to_string()),
     };
+
+    let file_sha256 = hex::encode(sha2::Sha256::digest(content.as_bytes()));
 
     if let Err(e) = tokio::fs::create_dir_all(&state.work_dir).await {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create work dir: {}", e));
@@ -703,12 +727,16 @@ async fn compose_up(
         timestamp: Utc::now().to_rfc3339(),
         action: "compose_up".into(),
         tag: Some(payload.tag.clone()),
+        commit: Some(tag_info.commit_sha.clone()),
         file: Some(file.clone()),
+        file_sha256: Some(file_sha256.clone()),
         services: payload.services,
         container: None,
     });
     *state.deployed_tag.write().await = Some(payload.tag);
+    *state.deployed_commit.write().await = Some(tag_info.commit_sha);
     *state.deployed_file.write().await = Some(file);
+    *state.deployed_file_sha256.write().await = Some(file_sha256);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -726,9 +754,10 @@ async fn compose_down(
         return err_response(code, msg);
     }
 
-    if let Err((code, msg)) = validate_tag(&state, &payload.tag).await {
-        return err_response(code, msg);
-    }
+    let tag_info = match validate_tag(&state, &payload.tag).await {
+        Ok(info) => info,
+        Err((code, msg)) => return err_response(code, msg),
+    };
 
     if !payload.env.is_empty() {
         if let Err(msg) = validate_env_vars(&payload.env) {
@@ -767,7 +796,9 @@ async fn compose_down(
         timestamp: Utc::now().to_rfc3339(),
         action: "compose_down".into(),
         tag: Some(payload.tag),
+        commit: Some(tag_info.commit_sha),
         file: Some(file),
+        file_sha256: None,
         services: payload.services,
         container: None,
     });
@@ -832,7 +863,9 @@ async fn docker_restart(
                 timestamp: Utc::now().to_rfc3339(),
                 action: "docker_restart".into(),
                 tag: None,
+                commit: None,
                 file: None,
+                file_sha256: None,
                 services: vec![],
                 container: Some(payload.container),
             });
@@ -864,7 +897,9 @@ async fn docker_clean(
                 timestamp: Utc::now().to_rfc3339(),
                 action: "docker_clean".into(),
                 tag: None,
+                commit: None,
                 file: None,
+                file_sha256: None,
                 services: vec![],
                 container: None,
             });
@@ -970,8 +1005,10 @@ async fn attestation_report(
 
 async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let tag = state.deployed_tag.read().await.clone();
+    let commit = state.deployed_commit.read().await.clone();
     let file = state.deployed_file.read().await.clone();
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, file, output: None, error: None }))
+    let file_sha256 = state.deployed_file_sha256.read().await.clone();
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, error: None }))
 }
 
 // --- Shell Commands ---
@@ -1096,7 +1133,9 @@ async fn main() -> Result<()> {
         work_dir: PathBuf::from(work_dir),
         env_files,
         deployed_tag: RwLock::new(None),
+        deployed_commit: RwLock::new(None),
         deployed_file: RwLock::new(None),
+        deployed_file_sha256: RwLock::new(None),
         actions: RwLock::new(Vec::new()),
         http: reqwest::Client::new(),
     });
