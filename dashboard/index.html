@@ -40,8 +40,12 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 .instance-item .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--text2); }
 .instance-item .dot.online { background: var(--success); }
 .instance-item .dot.offline { background: var(--danger); }
-.instance-item .name { font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instance-item .inst-info { flex: 1; min-width: 0; }
+.instance-item .name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instance-item .ip { font-size: 11px; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instance-item .inst-meta { text-align: right; flex-shrink: 0; }
 .instance-item .tag { font-size: 11px; color: var(--text2); }
+.instance-item .file { font-size: 10px; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
 .btn-remove { background: none; color: var(--text2); font-size: 14px; padding: 0 4px; opacity: 0; transition: opacity 0.1s; }
 .instance-item:hover .btn-remove { opacity: 1; }
 .btn-remove:hover { color: var(--danger); }
@@ -183,7 +187,7 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
           </div>
           <div class="card-body">
             <div style="margin-bottom:10px;font-size:13px">
-              Deployed tag: <strong id="deployedTag">-</strong>
+              Deployed tag: <strong id="deployedTag">-</strong> &middot; File: <strong id="deployedFile">-</strong>
             </div>
             <div id="containersSection">
               <table class="containers-table">
@@ -247,6 +251,7 @@ let instances = [];
 let selectedId = null;
 let statusTimers = {};
 let autoRefreshTimer = null;
+let deployingInstances = new Set();
 let terminalSize = 0;
 const MAX_TERMINAL_BYTES = 200000;
 
@@ -348,8 +353,14 @@ function renderSidebar() {
   el.innerHTML = instances.map(i => `
     <div class="instance-item ${i.id === selectedId ? 'active' : ''}" onclick="selectInstance('${i.id}')">
       <div class="dot ${i._status || ''}" id="dot-${i.id}"></div>
-      <div class="name">${esc(i.name)}</div>
-      <div class="tag" id="tag-${i.id}">${i._deployedTag || ''}</div>
+      <div class="inst-info">
+        <div class="name">${esc(i.name)}</div>
+        <div class="ip">${esc(extractHost(i.url))}</div>
+      </div>
+      <div class="inst-meta">
+        <div class="tag" id="tag-${i.id}">${i._deployedTag || ''}</div>
+        <div class="file" id="file-${i.id}" title="${esc(i._deployedFile || '')}">${esc(i._deployedFile || '')}</div>
+      </div>
       <button class="btn-remove" onclick="event.stopPropagation();removeInstance('${i.id}')" title="Remove">&times;</button>
     </div>
   `).join('');
@@ -360,6 +371,7 @@ async function selectInstance(id) {
   renderSidebar();
   document.getElementById('emptyState').style.display = 'none';
   document.getElementById('instancePanel').style.display = '';
+  updateDeployButtons();
   clearTerminal();
   document.getElementById('logsOutput').textContent = 'Click "Refresh" to load logs';
   loadTags();
@@ -419,18 +431,23 @@ async function checkInstanceStatus(id) {
     if (inst) {
       inst._status = 'online';
       inst._deployedTag = data.tag || '-';
+      inst._deployedFile = data.file || '';
     }
     const dot = document.getElementById(`dot-${id}`);
     if (dot) { dot.className = 'dot online'; }
     const tag = document.getElementById(`tag-${id}`);
     if (tag) { tag.textContent = data.tag || ''; }
+    const file = document.getElementById(`file-${id}`);
+    if (file) { file.textContent = data.file || ''; file.title = data.file || ''; }
   } catch {
     const inst = instances.find(i => i.id === id);
-    if (inst) { inst._status = 'offline'; inst._deployedTag = ''; }
+    if (inst) { inst._status = 'offline'; inst._deployedTag = ''; inst._deployedFile = ''; }
     const dot = document.getElementById(`dot-${id}`);
     if (dot) { dot.className = 'dot offline'; }
     const tag = document.getElementById(`tag-${id}`);
     if (tag) { tag.textContent = ''; }
+    const file = document.getElementById(`file-${id}`);
+    if (file) { file.textContent = ''; file.title = ''; }
   }
 }
 
@@ -506,6 +523,12 @@ async function deploy() {
   const file = document.getElementById('fileSelect').value;
   if (!tag || !file) { toast('Select tag and file', 'error'); return; }
 
+  const targetId = selectedId;
+  if (deployingInstances.has(targetId)) {
+    toast('Operation already in progress on this instance', 'error');
+    return;
+  }
+
   const body = {
     tag, file,
     services: getServices(),
@@ -513,9 +536,9 @@ async function deploy() {
     force_recreate: document.getElementById('forceRecreate').checked,
   };
 
-  const targetId = selectedId;
+  deployingInstances.add(targetId);
+  updateDeployButtons();
   clearTerminal();
-  setDeploying(true);
   appendTerminal(`> Deploying ${tag} / ${file}...\n`, 'stdout');
 
   try {
@@ -525,7 +548,8 @@ async function deploy() {
   } catch(e) {
     if (selectedId === targetId) appendTerminal(`Error: ${e.message}\n`, 'error');
   }
-  if (selectedId === targetId) setDeploying(false);
+  deployingInstances.delete(targetId);
+  if (selectedId === targetId) updateDeployButtons();
   refreshStatus();
 }
 
@@ -533,6 +557,12 @@ async function composeDown() {
   const tag = document.getElementById('tagSelect').value;
   const file = document.getElementById('fileSelect').value;
   if (!tag) { toast('Select a tag', 'error'); return; }
+
+  const targetId = selectedId;
+  if (deployingInstances.has(targetId)) {
+    toast('Operation already in progress on this instance', 'error');
+    return;
+  }
 
   const body = {
     tag,
@@ -542,9 +572,9 @@ async function composeDown() {
     env: getEnvVars(),
   };
 
-  const targetId = selectedId;
+  deployingInstances.add(targetId);
+  updateDeployButtons();
   clearTerminal();
-  setDeploying(true);
   appendTerminal(`> Compose down...\n`, 'stdout');
 
   try {
@@ -554,7 +584,8 @@ async function composeDown() {
   } catch(e) {
     if (selectedId === targetId) appendTerminal(`Error: ${e.message}\n`, 'error');
   }
-  if (selectedId === targetId) setDeploying(false);
+  deployingInstances.delete(targetId);
+  if (selectedId === targetId) updateDeployButtons();
   refreshStatus();
 }
 
@@ -568,9 +599,10 @@ function handleStreamEvent(ev) {
   else if (ev.event === 'error') appendTerminal(`Error: ${ev.data}\n`, 'error');
 }
 
-function setDeploying(on) {
-  document.getElementById('deployBtn').disabled = on;
-  document.getElementById('downBtn').disabled = on;
+function updateDeployButtons() {
+  const busy = selectedId && deployingInstances.has(selectedId);
+  document.getElementById('deployBtn').disabled = busy;
+  document.getElementById('downBtn').disabled = busy;
 }
 
 // --- Status ---
@@ -579,8 +611,10 @@ async function refreshStatus() {
   try {
     const ver = await apiJson('GET', `/api/instances/${selectedId}/version`);
     document.getElementById('deployedTag').textContent = ver.tag || '-';
+    document.getElementById('deployedFile').textContent = ver.file || '-';
   } catch(e) {
     document.getElementById('deployedTag').textContent = 'offline';
+    document.getElementById('deployedFile').textContent = '-';
   }
 
   try {
@@ -716,6 +750,10 @@ function esc(s) {
   const div = document.createElement('div');
   div.textContent = s;
   return div.innerHTML;
+}
+
+function extractHost(url) {
+  try { return new URL(url).hostname; } catch { return ''; }
 }
 </script>
 </body>

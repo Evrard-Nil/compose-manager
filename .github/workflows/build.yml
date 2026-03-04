@@ -10,6 +10,7 @@ on:
 env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
+  DASHBOARD_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-dashboard
 
 jobs:
   reproducible-docker-image:
@@ -83,4 +84,48 @@ jobs:
             echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
             echo "- digest: \`${{ env.IMAGE_DIGEST }}\`"
             echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dashboard-image:
+    name: Dashboard Docker Image
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Extract image tag from GitHub ref
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
+            TAG=${GITHUB_REF_NAME#v}
+          elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
+            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'master' ]]; then echo 'latest'; else echo 'dev'; fi)
+          else
+            echo "Unsupported ref type: ${GITHUB_REF_TYPE}" >&2
+            exit 1
+          fi
+          echo "DASHBOARD_IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.DASHBOARD_IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+
+      - name: Build and push dashboard image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dashboard
+          push: true
+          tags: ${{ env.DASHBOARD_IMAGE_REFERENCE }}
+
+      - name: Generate build summary
+        run: |
+          {
+            echo "## compose-manager-dashboard docker image"
+            echo ""
+            echo "- tag: \`${{ env.DASHBOARD_IMAGE_REFERENCE }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
