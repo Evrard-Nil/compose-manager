@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
@@ -28,11 +28,19 @@ struct Config {
     instances: Vec<Instance>,
 }
 
+struct CacheEntry {
+    value: serde_json::Value,
+    fetched_at: Instant,
+}
+
+const GITHUB_CACHE_TTL_SECS: u64 = 300; // 5 minutes
+
 struct AppState {
     dashboard_token: String,
     config_path: PathBuf,
     instances: RwLock<Vec<Instance>>,
     http: reqwest::Client,
+    github_cache: RwLock<HashMap<String, CacheEntry>>,
 }
 
 #[derive(Serialize)]
@@ -428,6 +436,19 @@ async fn github_tags(
         Err(e) => return e,
     };
 
+    let cache_key = format!("tags:{}/{}", owner, name);
+    let ttl = std::time::Duration::from_secs(GITHUB_CACHE_TTL_SECS);
+
+    // Check cache
+    {
+        let cache = state.github_cache.read().await;
+        if let Some(entry) = cache.get(&cache_key) {
+            if entry.fetched_at.elapsed() < ttl {
+                return Json(entry.value.clone()).into_response();
+            }
+        }
+    }
+
     let url = format!(
         "https://api.github.com/repos/{}/{}/tags?per_page=100",
         owner, name
@@ -448,7 +469,11 @@ async fn github_tags(
                 );
             }
             match resp.json::<serde_json::Value>().await {
-                Ok(tags) => Json(tags).into_response(),
+                Ok(tags) => {
+                    let mut cache = state.github_cache.write().await;
+                    cache.insert(cache_key, CacheEntry { value: tags.clone(), fetched_at: Instant::now() });
+                    Json(tags).into_response()
+                }
                 Err(e) => err_json(StatusCode::BAD_GATEWAY, format!("Failed to parse GitHub response: {}", e)),
             }
         }
@@ -469,6 +494,19 @@ async fn github_files(
         Ok(r) => r,
         Err(e) => return e,
     };
+
+    let cache_key = format!("files:{}/{}/{}", owner, name, params.tag);
+    let ttl = std::time::Duration::from_secs(GITHUB_CACHE_TTL_SECS);
+
+    // Check cache
+    {
+        let cache = state.github_cache.read().await;
+        if let Some(entry) = cache.get(&cache_key) {
+            if entry.fetched_at.elapsed() < ttl {
+                return Json(entry.value.clone()).into_response();
+            }
+        }
+    }
 
     let url = format!(
         "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
@@ -498,7 +536,10 @@ async fn github_files(
                         .map(|e| e.path.as_str())
                         .filter(|p| p.ends_with(".yml") || p.ends_with(".yaml"))
                         .collect();
-                    Json(files).into_response()
+                    let value = serde_json::to_value(&files).unwrap();
+                    let mut cache = state.github_cache.write().await;
+                    cache.insert(cache_key, CacheEntry { value: value.clone(), fetched_at: Instant::now() });
+                    Json(value).into_response()
                 }
                 Err(e) => err_json(
                     StatusCode::BAD_GATEWAY,
@@ -547,6 +588,7 @@ async fn main() -> Result<()> {
         config_path,
         instances: RwLock::new(config.instances),
         http: reqwest::Client::new(),
+        github_cache: RwLock::new(HashMap::new()),
     });
 
     let app = Router::new()
