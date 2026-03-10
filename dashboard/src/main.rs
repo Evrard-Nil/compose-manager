@@ -21,6 +21,8 @@ struct Instance {
     url: String,
     bearer_token: String,
     github_repo: String,
+    #[serde(default)]
+    env_vars: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -268,6 +270,7 @@ async fn list_instances(
             url: i.url.clone(),
             bearer_token: "***".into(),
             github_repo: i.github_repo.clone(),
+            env_vars: i.env_vars.clone(),
         })
         .collect();
 
@@ -289,6 +292,7 @@ async fn add_instance(
         url: payload.url.trim_end_matches('/').to_string(),
         bearer_token: payload.bearer_token,
         github_repo: payload.github_repo,
+        env_vars: HashMap::new(),
     };
 
     let mut instances = state.instances.write().await;
@@ -334,6 +338,35 @@ async fn remove_instance(
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn update_instance_env(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(env_vars): Json<HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+        return e;
+    }
+
+    let mut instances = state.instances.write().await;
+    let instance = match instances.iter_mut().find(|i| i.id == id) {
+        Some(i) => i,
+        None => return err_json(StatusCode::NOT_FOUND, "Instance not found"),
+    };
+
+    instance.env_vars = env_vars;
+
+    let config = Config {
+        instances: instances.clone(),
+    };
+    if let Err(e) = save_config(&state.config_path, &config) {
+        error!("Failed to save config: {}", e);
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save config");
+    }
+
+    Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
 // --- Proxy handlers ---
@@ -596,6 +629,7 @@ async fn main() -> Result<()> {
         .route("/api/instances", get(list_instances))
         .route("/api/instances", post(add_instance))
         .route("/api/instances/:id", delete(remove_instance))
+        .route("/api/instances/:id/env", axum::routing::put(update_instance_env))
         .route("/api/instances/:id/compose/up", post(proxy_compose_up))
         .route(
             "/api/instances/:id/compose/down",
