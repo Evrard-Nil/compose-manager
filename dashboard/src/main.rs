@@ -142,6 +142,7 @@ async fn proxy_json(
     method: reqwest::Method,
     path: &str,
     body: Option<serde_json::Value>,
+    timeout_secs: Option<u64>,
 ) -> Response {
     let instances = state.instances.read().await;
     let instance = match instances.iter().find(|i| i.id == instance_id) {
@@ -155,7 +156,7 @@ async fn proxy_json(
         .http
         .request(method, &url)
         .header("Authorization", format!("Bearer {}", instance.bearer_token))
-        .timeout(std::time::Duration::from_secs(30));
+        .timeout(std::time::Duration::from_secs(timeout_secs.unwrap_or(30)));
 
     if let Some(body) = body {
         req = req
@@ -404,7 +405,7 @@ async fn proxy_compose_logs(
     if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
         return e;
     }
-    proxy_json(&state, &id, reqwest::Method::POST, "compose/logs", Some(body)).await
+    proxy_json(&state, &id, reqwest::Method::POST, "compose/logs", Some(body), None).await
 }
 
 async fn proxy_docker_ps(
@@ -415,7 +416,7 @@ async fn proxy_docker_ps(
     if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
         return e;
     }
-    proxy_json(&state, &id, reqwest::Method::GET, "docker/ps", None).await
+    proxy_json(&state, &id, reqwest::Method::GET, "docker/ps", None, None).await
 }
 
 async fn proxy_docker_restart(
@@ -427,7 +428,7 @@ async fn proxy_docker_restart(
     if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
         return e;
     }
-    proxy_json(&state, &id, reqwest::Method::POST, "docker/restart", Some(body)).await
+    proxy_json(&state, &id, reqwest::Method::POST, "docker/restart", Some(body), None).await
 }
 
 async fn proxy_docker_clean(
@@ -439,7 +440,7 @@ async fn proxy_docker_clean(
     if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
         return e;
     }
-    proxy_json(&state, &id, reqwest::Method::POST, "docker/clean", Some(body)).await
+    proxy_json(&state, &id, reqwest::Method::POST, "docker/clean", Some(body), None).await
 }
 
 async fn proxy_version(
@@ -450,7 +451,7 @@ async fn proxy_version(
     if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
         return e;
     }
-    proxy_json(&state, &id, reqwest::Method::GET, "version", None).await
+    proxy_json(&state, &id, reqwest::Method::GET, "version", None, Some(5)).await
 }
 
 // --- GitHub API ---
