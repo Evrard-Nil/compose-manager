@@ -166,7 +166,10 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
             <div class="form-group">
               <label>Environment Variables</label>
               <div class="env-rows" id="envRows"></div>
-              <button class="btn-ghost btn-sm" style="margin-top:4px" onclick="addEnvRow()">+ Add Variable</button>
+              <div style="display:flex;gap:6px;margin-top:4px">
+                <button class="btn-ghost btn-sm" onclick="addEnvRow()">+ Add Variable</button>
+                <button class="btn-ghost btn-sm" onclick="saveEnvVars()" id="saveEnvBtn">Save</button>
+              </div>
             </div>
             <div class="form-group">
               <label class="checkbox-label"><input type="checkbox" id="forceRecreate"> Force recreate</label>
@@ -374,8 +377,30 @@ async function selectInstance(id) {
   updateDeployButtons();
   clearTerminal();
   document.getElementById('logsOutput').textContent = 'Click "Refresh" to load logs';
+  loadEnvVars();
   loadTags();
   refreshStatus();
+}
+
+function loadEnvVars() {
+  const container = document.getElementById('envRows');
+  container.innerHTML = '';
+  const inst = instances.find(i => i.id === selectedId);
+  if (!inst || !inst.env_vars) return;
+  for (const [k, v] of Object.entries(inst.env_vars)) {
+    addEnvRow(k, v);
+  }
+}
+
+async function saveEnvVars() {
+  if (!selectedId) return;
+  const env = getEnvVars();
+  try {
+    await apiJson('PUT', `/api/instances/${selectedId}/env`, env);
+    const inst = instances.find(i => i.id === selectedId);
+    if (inst) inst.env_vars = env;
+    toast('Env vars saved', 'success');
+  } catch(e) { toast(e.message, 'error'); }
 }
 
 function showAddModal() {
