@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -1011,6 +1011,54 @@ async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, error: None }))
 }
 
+// --- Dstack guest-agent management ---
+
+const DSTACK_AGENT_UNIT: &str = "dstack-guest-agent.service";
+
+async fn dstack_agent_action(
+    State(state): State<Arc<AppState>>,
+    AxumPath(action): AxumPath<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    match action.as_str() {
+        "start" | "stop" | "restart" | "status" => {}
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid action '{}': must be one of start, stop, restart, status", action),
+            );
+        }
+    }
+
+    info!(action = %action, unit = DSTACK_AGENT_UNIT, "Managing dstack-guest-agent");
+
+    match run_host_systemctl(&action, DSTACK_AGENT_UNIT) {
+        Ok(output) => {
+            if action != "status" {
+                state.actions.write().await.push(DeploymentAction {
+                    timestamp: Utc::now().to_rfc3339(),
+                    action: format!("dstack_agent_{}", action),
+                    tag: None,
+                    commit: None,
+                    file: None,
+                    file_sha256: None,
+                    services: vec![],
+                    container: None,
+                });
+            }
+            ok_output(output)
+        }
+        Err(e) => {
+            error!(action = %action, unit = DSTACK_AGENT_UNIT, error = %e, "systemctl failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    }
+}
+
 // --- Shell Commands ---
 
 fn run_command(program: &str, args: &[&str]) -> Result<String> {
@@ -1068,6 +1116,54 @@ fn run_docker_compose(work_dir: &Path, args: &[&str], file: &str, env_files: &[S
 
     info!(command = "docker compose", file = file, args = ?args, "Command completed successfully");
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// Runs `systemctl <action> <unit>` against the CVM host's PID 1 systemd by
+// entering its mount/UTS/IPC/PID/network namespaces via nsenter. Requires the
+// container to be started with `pid: host` and CAP_SYS_ADMIN.
+fn run_host_systemctl(action: &str, unit: &str) -> Result<String> {
+    info!(command = "nsenter ... systemctl", action = action, unit = unit, "Running host systemctl");
+
+    let output = Command::new("nsenter")
+        .args(["-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "systemctl", action, unit])
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to execute: nsenter -t 1 -m -u -i -n -p -- systemctl {} {}",
+                action, unit
+            )
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{}\n{}", stdout, stderr),
+    };
+
+    // `systemctl status` exits non-zero for inactive/failed states (e.g. 3 = inactive).
+    // These are valid responses, not infrastructure errors — return the output as-is.
+    if action == "status" {
+        return Ok(combined);
+    }
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "systemctl {} {} failed (exit {}):\n{}",
+            action,
+            unit,
+            output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            combined
+        ));
+    }
+
+    Ok(combined)
 }
 
 fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
@@ -1147,6 +1243,7 @@ async fn main() -> Result<()> {
         .route("/docker/clean", post(docker_clean))
         .route("/docker/ps", get(docker_ps))
         .route("/docker/restart", post(docker_restart))
+        .route("/dstack-agent/:action", post(dstack_agent_action))
         .route("/v1/attestation/report", get(attestation_report))
         .route("/version", get(version))
         .with_state(state);

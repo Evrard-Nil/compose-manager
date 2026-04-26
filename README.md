@@ -52,6 +52,26 @@ Returns the currently deployed tag.
 {"status": "ok", "tag": "v1.0.0"}
 ```
 
+### POST /dstack-agent/:action
+Manage the `dstack-guest-agent.service` running on the CVM host. Supported actions: `start`, `stop`, `restart`, `status`.
+
+The handler runs `nsenter -t 1 -m -u -i -n -p -- systemctl <action> dstack-guest-agent.service`, so the container must have `pid: host` and `CAP_SYS_ADMIN` (already set in the bundled compose templates).
+
+**Examples:**
+```bash
+# Restart the dstack guest agent (e.g. to retry a stuck TDX quote attempt)
+curl -X POST http://localhost:8080/dstack-agent/restart \
+  -H "Authorization: Bearer your-secret-token"
+
+# Check status
+curl -X POST http://localhost:8080/dstack-agent/status \
+  -H "Authorization: Bearer your-secret-token"
+```
+
+`status` returns 200 with the systemctl output regardless of the unit's active state (inactive/failed states are reported in the output, not as HTTP errors). `start`/`stop`/`restart` return 500 if systemctl exits non-zero.
+
+Non-status actions are appended to the deployment action log included in `/v1/attestation/report` (e.g. `dstack_agent_restart`).
+
 ### POST /git/checkout
 Checkout a specific git tag.
 
