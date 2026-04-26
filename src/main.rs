@@ -19,6 +19,7 @@ use std::{
     process::Command,
     sync::Arc,
     task::{Context as TaskContext, Poll},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -181,21 +182,27 @@ struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 type ApiResult = (StatusCode, Json<StatusResponse>);
 
 fn ok(tag: Option<String>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: None }))
 }
 
 fn ok_output(output: String) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code: None, error: None }))
+}
+
+fn ok_systemctl(output: String, exit_code: Option<i32>) -> ApiResult {
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code, error: None }))
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
-    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, error: Some(msg.into()) }))
+    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: Some(msg.into()) }))
 }
 
 fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -206,6 +213,7 @@ fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
         file: None,
         file_sha256: None,
         output: None,
+        exit_code: None,
         error: Some(msg.into()),
     })
     .unwrap();
@@ -1008,12 +1016,44 @@ async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let commit = state.deployed_commit.read().await.clone();
     let file = state.deployed_file.read().await.clone();
     let file_sha256 = state.deployed_file_sha256.read().await.clone();
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, exit_code: None, error: None }))
 }
 
 // --- Dstack guest-agent management ---
 
+// SECURITY: this MUST stay a compile-time constant. The handler runs nsenter into
+// PID 1's namespaces with CAP_SYS_ADMIN; an attacker-controlled unit name would
+// give them arbitrary host-side systemctl, i.e. RCE on the CVM host.
 const DSTACK_AGENT_UNIT: &str = "dstack-guest-agent.service";
+
+const DSTACK_AGENT_ACTIONS: &[&str] = &["start", "stop", "restart", "status"];
+
+// systemctl restart on a stuck unit can sit in `deactivating` for the full
+// TimeoutStopSec (commonly 90s). Cap the wait so we never hold a request thread
+// indefinitely.
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn is_valid_dstack_action(action: &str) -> bool {
+    DSTACK_AGENT_ACTIONS.contains(&action)
+}
+
+struct SystemctlOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    success: bool,
+}
+
+impl SystemctlOutput {
+    fn combined(&self) -> String {
+        match (self.stdout.is_empty(), self.stderr.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => self.stdout.clone(),
+            (true, false) => self.stderr.clone(),
+            (false, false) => format!("{}\n{}", self.stdout, self.stderr),
+        }
+    }
+}
 
 async fn dstack_agent_action(
     State(state): State<Arc<AppState>>,
@@ -1024,39 +1064,79 @@ async fn dstack_agent_action(
         return e;
     }
 
-    match action.as_str() {
-        "start" | "stop" | "restart" | "status" => {}
-        _ => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                format!("invalid action '{}': must be one of start, stop, restart, status", action),
-            );
-        }
+    if !is_valid_dstack_action(&action) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid action '{}': must be one of {}",
+                action,
+                DSTACK_AGENT_ACTIONS.join(", ")
+            ),
+        );
     }
 
     info!(action = %action, unit = DSTACK_AGENT_UNIT, "Managing dstack-guest-agent");
 
-    match run_host_systemctl(&action, DSTACK_AGENT_UNIT) {
-        Ok(output) => {
-            if action != "status" {
-                state.actions.write().await.push(DeploymentAction {
-                    timestamp: Utc::now().to_rfc3339(),
-                    action: format!("dstack_agent_{}", action),
-                    tag: None,
-                    commit: None,
-                    file: None,
-                    file_sha256: None,
-                    services: vec![],
-                    container: None,
-                });
-            }
-            ok_output(output)
-        }
+    let result = match run_host_systemctl(&action, DSTACK_AGENT_UNIT).await {
+        Ok(r) => r,
         Err(e) => {
-            error!(action = %action, unit = DSTACK_AGENT_UNIT, error = %e, "systemctl failed");
-            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            // Process-level failure: nsenter binary missing, missing CAP_SYS_ADMIN,
+            // timeout, etc. This is infrastructure broken — always 500, never 200.
+            error!(
+                action = %action,
+                unit = DSTACK_AGENT_UNIT,
+                error = %e,
+                "Failed to invoke systemctl on host"
+            );
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
+    };
+
+    let combined = result.combined();
+
+    // For status, any process-level success is a useful response — exit 0 means
+    // active, 3 means inactive, 4 means unit-not-found, etc. Surface the exit
+    // code so clients can distinguish; don't hide an inactive unit behind a 500.
+    if action == "status" {
+        return ok_systemctl(combined, result.exit_code);
     }
+
+    // start/stop/restart: log the attempt regardless of outcome (failed restarts
+    // are valuable forensic signal), then map systemctl exit to HTTP status.
+    state.actions.write().await.push(DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: format!("dstack_agent_{}", action),
+        tag: None,
+        commit: None,
+        file: None,
+        file_sha256: None,
+        services: vec![],
+        container: None,
+    });
+
+    if !result.success {
+        error!(
+            action = %action,
+            unit = DSTACK_AGENT_UNIT,
+            exit_code = ?result.exit_code,
+            "systemctl exited non-zero"
+        );
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "systemctl {} {} exited {}:\n{}",
+                action,
+                DSTACK_AGENT_UNIT,
+                result
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                combined
+            ),
+        );
+    }
+
+    ok_systemctl(combined, result.exit_code)
 }
 
 // --- Shell Commands ---
@@ -1121,49 +1201,48 @@ fn run_docker_compose(work_dir: &Path, args: &[&str], file: &str, env_files: &[S
 // Runs `systemctl <action> <unit>` against the CVM host's PID 1 systemd by
 // entering its mount/UTS/IPC/PID/network namespaces via nsenter. Requires the
 // container to be started with `pid: host` and CAP_SYS_ADMIN.
-fn run_host_systemctl(action: &str, unit: &str) -> Result<String> {
-    info!(command = "nsenter ... systemctl", action = action, unit = unit, "Running host systemctl");
+//
+// Returns Err only on infrastructure failure (nsenter missing, capability
+// denied, timeout). A non-zero systemctl exit is a *successful* invocation
+// reported as `success: false` in the result so callers can decide what to
+// do with the exit code (status uses it, start/stop/restart map it to 500).
+async fn run_host_systemctl(action: &str, unit: &str) -> Result<SystemctlOutput> {
+    info!(
+        command = "nsenter ... systemctl",
+        action = action,
+        unit = unit,
+        timeout_secs = SYSTEMCTL_TIMEOUT.as_secs(),
+        "Running host systemctl"
+    );
 
-    let output = Command::new("nsenter")
+    let invocation = AsyncCommand::new("nsenter")
         .args(["-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "systemctl", action, unit])
-        .output()
-        .with_context(|| {
-            format!(
+        .output();
+
+    let output = match tokio::time::timeout(SYSTEMCTL_TIMEOUT, invocation).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Err(anyhow!(e).context(format!(
                 "Failed to execute: nsenter -t 1 -m -u -i -n -p -- systemctl {} {}",
                 action, unit
-            )
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => stdout,
-        (true, false) => stderr,
-        (false, false) => format!("{}\n{}", stdout, stderr),
+            )));
+        }
+        Err(_) => {
+            return Err(anyhow!(
+                "nsenter ... systemctl {} {} timed out after {}s",
+                action,
+                unit,
+                SYSTEMCTL_TIMEOUT.as_secs()
+            ));
+        }
     };
 
-    // `systemctl status` exits non-zero for inactive/failed states (e.g. 3 = inactive).
-    // These are valid responses, not infrastructure errors — return the output as-is.
-    if action == "status" {
-        return Ok(combined);
-    }
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "systemctl {} {} failed (exit {}):\n{}",
-            action,
-            unit,
-            output
-                .status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".into()),
-            combined
-        ));
-    }
-
-    Ok(combined)
+    Ok(SystemctlOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code(),
+        success: output.status.success(),
+    })
 }
 
 fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
@@ -1253,4 +1332,92 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dstack_action_allowlist_accepts_known_actions() {
+        for action in DSTACK_AGENT_ACTIONS {
+            assert!(is_valid_dstack_action(action), "expected '{}' valid", action);
+        }
+    }
+
+    #[test]
+    fn dstack_action_allowlist_rejects_unknown_actions() {
+        for bad in [
+            "",
+            "reload",
+            "enable",
+            "disable",
+            "kill",
+            "Start",        // case sensitive
+            "RESTART",      // case sensitive
+            "start ",       // trailing whitespace
+            " start",       // leading whitespace
+            "start;rm",     // shell metachar attempt
+            "start\nstop",  // newline
+            "start\0",      // null byte
+            "../etc/passwd",
+        ] {
+            assert!(
+                !is_valid_dstack_action(bad),
+                "expected '{}' rejected",
+                bad.escape_debug()
+            );
+        }
+    }
+
+    #[test]
+    fn dstack_unit_is_dstack_guest_agent() {
+        // Guard against accidental retargeting. If you legitimately need to
+        // change this constant, update this test and audit every call site.
+        assert_eq!(DSTACK_AGENT_UNIT, "dstack-guest-agent.service");
+    }
+
+    #[test]
+    fn systemctl_combined_handles_empty_stderr() {
+        let o = SystemctlOutput {
+            stdout: "active (running)".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+        };
+        assert_eq!(o.combined(), "active (running)");
+    }
+
+    #[test]
+    fn systemctl_combined_handles_empty_stdout() {
+        let o = SystemctlOutput {
+            stdout: String::new(),
+            stderr: "Unit not found".into(),
+            exit_code: Some(4),
+            success: false,
+        };
+        assert_eq!(o.combined(), "Unit not found");
+    }
+
+    #[test]
+    fn systemctl_combined_concatenates_both_streams() {
+        let o = SystemctlOutput {
+            stdout: "out".into(),
+            stderr: "err".into(),
+            exit_code: Some(1),
+            success: false,
+        };
+        assert_eq!(o.combined(), "out\nerr");
+    }
+
+    #[test]
+    fn systemctl_combined_handles_both_empty() {
+        let o = SystemctlOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+        };
+        assert_eq!(o.combined(), "");
+    }
 }
