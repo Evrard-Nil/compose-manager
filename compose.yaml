@@ -4,6 +4,9 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    pid: host
+    cap_add:
+      - SYS_ADMIN
     environment:
       GITHUB_REPO: "https://github.com/owner/repo"
       BEARER_TOKEN: "${BEARER_TOKEN}"

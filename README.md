@@ -52,6 +52,34 @@ Returns the currently deployed tag.
 {"status": "ok", "tag": "v1.0.0"}
 ```
 
+### POST /dstack-agent/:action
+Manage the `dstack-guest-agent.service` running on the CVM host. Supported actions: `start`, `stop`, `restart`, `status`.
+
+The handler runs `nsenter -t 1 -m -u -i -n -p -- systemctl <action> dstack-guest-agent.service`, so the container must have `pid: host` and `CAP_SYS_ADMIN` (already set in the bundled compose templates). Each call has a 120s timeout to bound the worst case (a stuck unit's `TimeoutStopSec` is typically 90s).
+
+**Examples:**
+```bash
+# Restart the dstack guest agent (e.g. to retry a stuck TDX quote attempt)
+curl -X POST http://localhost:8080/dstack-agent/restart \
+  -H "Authorization: Bearer your-secret-token"
+
+# Check status
+curl -X POST http://localhost:8080/dstack-agent/status \
+  -H "Authorization: Bearer your-secret-token"
+```
+
+**Response:** standard JSON with `output` (combined stdout+stderr) and `exit_code` (the systemctl exit). For `status`, useful exit codes are `0` (active), `3` (inactive), `4` (unit not found).
+
+**HTTP status codes:**
+- `200` — `status` always returns 200 on a successful systemctl invocation, regardless of the unit's active state. `start`/`stop`/`restart` return 200 only when systemctl exits 0.
+- `400` — invalid action.
+- `401` — missing/invalid bearer.
+- `500` — infrastructure error (nsenter missing, missing capability, timeout) **or** non-zero systemctl exit on `start`/`stop`/`restart`. The error body always includes the exit code (or `signal`) and combined output.
+
+**Side effects on attestation:** `start`/`stop`/`restart` (whether successful or not) append a `dstack_agent_<action>` entry to the deployment action log included in `/v1/attestation/report`. `status` is read-only and is not logged.
+
+**Caveat — self-attestation gap:** restart briefly takes the dstack guest agent offline. While the agent is down, `/v1/attestation/report` will fail with `dstack unavailable: Connection refused` because compose-manager fetches its TDX quote from the same agent. The window is typically 1–10s; clients should retry attestation after a restart.
+
 ### POST /git/checkout
 Checkout a specific git tag.
 
